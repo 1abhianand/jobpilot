@@ -1,0 +1,20 @@
+# Answers for application-form questions.
+#
+# `match` is a regular expression tested against the question, ignoring case. Answers you give on
+# Telegram are checked first, then these rules, then your profile in config.yaml, then Claude.
+# Dropdown and radio options are matched loosely, so "Yes" picks "Yes, I am".
+# Visa-sponsorship questions are left to Claude, which answers from profile.work_authorization and
+# the job's country.
+
+- match: '(authori[sz]ed|eligible|legally (able|permitted)) to work in india'
+  answer: 'Yes'
+- match: 'willing to relocate|open to relocat'
+  answer: 'Yes'
+- match: 'comfortable (working|to work) (from|in) (the )?office|work from office|hybrid|on-?site'
+  answer: 'Yes'
+- match: 'currently serving (your )?notice|serving notice'
+  answer: 'No'
+- match: 'how did you (hear|find out|come to know)'
+  answer: 'LinkedIn'
+- match: 'gender|pronoun|race|ethnicity|veteran|disability'
+  answer: 'Prefer not to say'

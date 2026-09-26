@@ -1,0 +1,12 @@
+# Your secrets and personal details
+.env
+config.yaml
+profile/
+data/
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/

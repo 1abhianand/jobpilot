@@ -1,0 +1,133 @@
+# jobpilot settings. Keys and passwords go in .env, never in this file.
+
+# dry_run goes through everything except the final click or send, so you can watch it work.
+# Switch to live once a few days of dry runs look right.
+mode: dry_run
+
+profile:
+  name: Your Name
+  email: you@example.com
+  phone: "+91 XXXXXXXXXX"
+  city: Bengaluru
+  linkedin_url: https://www.linkedin.com/in/your-handle/
+  github_url: ""
+  website: ""
+  years_experience: 0
+  notice_period_days: 60
+  current_ctc: "XX LPA"            # only used to fill application forms, never put in messages
+  expected_ctc: "XX LPA"
+  target_roles: [Backend Engineer, Software Engineer, AI Engineer]
+  preferred_locations: [Bengaluru, Remote (India)]
+  work_authorization: Authorized to work in India; would need visa sponsorship for any other country
+  pitch: >-
+    One or two lines on what you want next, in your words. It steers job scoring and every draft.
+
+filters:
+  title_include: []                # regexes; empty lets the scorer decide
+  title_exclude: ['\bintern(ship)?\b', '\b(principal|director|vp|head of)\b', '\b(sales|marketing|recruit\w*)\b']
+  company_exclude: [Ola, Olacabs, ANI Technologies, Ola Electric, Krutrim]   # your current employer at least
+
+llm:
+  model: claude-opus-5
+  scoring_model: ""                # empty = same as model; claude-haiku-4-5 here cuts cost a lot
+  scoring_effort: low              # job and company scoring, form answers
+  writing_effort: medium           # emails, notes, messages
+  research_effort: medium          # the weekly startup search
+
+schedule:
+  timezone: Asia/Kolkata
+  days: [mon, tue, wed, thu, fri, sat]
+  start: "09:30"
+  end: "20:00"                     # the daily summary arrives at this time
+
+browser:
+  channel: chrome                  # your installed Google Chrome
+  headless: false                  # a visible window is less likely to be flagged by LinkedIn
+
+approvals:
+  max_open_cards: 6                # Telegram cards waiting on you at any one time
+  expire_after_days: 7
+
+email:
+  enabled: true
+  per_day: 15
+  min_gap_minutes: 4
+  followup_after_days: 5
+  max_followups: 1
+  attach_resume: false             # cold emails with attachments land in spam more often
+  signature: |
+    Your Name
+    linkedin.com/in/your-handle | +91 XXXXXXXXXX
+
+linkedin:
+  enabled: true
+  # Your job searches, with the Easy Apply filter on (f_AL=true). f_TPR=r604800 = past week.
+  search_urls:
+    - https://www.linkedin.com/jobs/search/?keywords=backend%20engineer&location=India&f_AL=true&f_TPR=r604800&sortBy=DD
+    - https://www.linkedin.com/jobs/search/?keywords=software%20engineer&location=Bengaluru&f_AL=true&f_TPR=r604800&sortBy=DD
+  every_hours: 6
+  reads_per_run: 25                # job pages read and scored per run
+  apply_per_day: 15
+  min_score: 72
+  connect_per_day: 15
+  connect_per_week: 80             # LinkedIn's own weekly limit is around 100
+  messages_per_day: 15
+  send_notes: true                 # the Free plan allows only a few notes a month
+  note_limit: 200                  # 300 on Premium
+  lookups_per_day: 8               # company "People" searches for non-YC startups
+
+instahyre:
+  enabled: true
+  search_urls:
+    - https://www.instahyre.com/candidate/opportunities/?matching=true
+  every_hours: 6
+  apply_per_day: 20
+  min_score: 72
+  # After `jobpilot doctor instahyre`, patterns can be overridden here, e.g.:
+  # selectors:
+  #   job_href: 'instahyre\.com/job-\d+'
+  #   apply: '^\s*apply\s*$'
+
+hirist:
+  enabled: true
+  search_urls: []                  # empty = your logged-in feed; add hirist.tech search URLs to widen it
+  every_hours: 6
+  apply_per_day: 20
+  min_score: 72
+
+wellfound:
+  enabled: true
+  search_urls:
+    - https://wellfound.com/jobs
+  every_hours: 8
+  apply_per_day: 8                 # each application note comes to Telegram first
+  min_score: 75
+
+waas:                              # YC's Work at a Startup
+  enabled: true
+  search_urls: []                  # jobs come in from YC company pages automatically
+  every_hours: 6
+  apply_per_day: 8                 # each note to the founders comes to Telegram first
+  min_score: 72
+
+outreach:
+  linkedin_per_company: 2          # founders or leaders per company who get a connection request
+  email_per_company: 1             # ... and who get a cold email
+
+yc:
+  enabled: true
+  regions: [India, Fully Remote, Remote]
+  min_batch_year: 2019
+  max_team_size: 300
+  score_per_day: 60                # companies scored per day for fit
+  companies_per_day: 6             # companies whose founders get drafts per day
+  min_fit: 70
+
+scout:                             # startups outside YC, found by Claude with web search
+  enabled: true
+  every_days: 7
+  per_run: 12
+  companies_per_day: 4
+  brief: >-
+    Seed to Series B product startups in India, or remote-first worldwide, that raised money in
+    the last year and are hiring backend or AI engineers.

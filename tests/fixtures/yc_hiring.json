@@ -1,0 +1,102 @@
+[
+ {
+  "id": 1,
+  "name": "Acme AI",
+  "slug": "acme-ai",
+  "website": "https://www.acme-ai.example",
+  "all_locations": "Bengaluru, KA, India",
+  "long_description": "Acme AI builds LLM agents for customer support teams.",
+  "one_liner": "Support agents",
+  "team_size": 12,
+  "industry": "B2B",
+  "tags": [
+   "AI",
+   "Customer Support"
+  ],
+  "isHiring": true,
+  "batch": "Winter 2024",
+  "status": "Active",
+  "industries": [
+   "B2B"
+  ],
+  "regions": [
+   "India",
+   "South Asia"
+  ],
+  "stage": "Early"
+ },
+ {
+  "id": 2,
+  "name": "Bayside Robotics",
+  "slug": "bayside",
+  "website": "https://bayside.example",
+  "all_locations": "San Francisco",
+  "team_size": 30,
+  "isHiring": true,
+  "batch": "Summer 2023",
+  "status": "Active",
+  "regions": [
+   "United States of America"
+  ],
+  "stage": "Early"
+ },
+ {
+  "id": 3,
+  "name": "Oldco",
+  "slug": "oldco",
+  "website": "https://oldco.example",
+  "team_size": 40,
+  "isHiring": true,
+  "batch": "Winter 2012",
+  "status": "Active",
+  "regions": [
+   "India"
+  ],
+  "stage": "Growth"
+ },
+ {
+  "id": 4,
+  "name": "Ola Foods",
+  "slug": "ola-foods",
+  "website": "https://olafoods.example",
+  "team_size": 10,
+  "isHiring": true,
+  "batch": "Winter 2025",
+  "status": "Active",
+  "regions": [
+   "Remote",
+   "Fully Remote"
+  ],
+  "stage": "Early"
+ },
+ {
+  "id": 5,
+  "name": "Bigcorp",
+  "slug": "bigcorp",
+  "website": "https://bigcorp.example",
+  "team_size": 5000,
+  "isHiring": true,
+  "batch": "Summer 2020",
+  "status": "Active",
+  "regions": [
+   "Remote"
+  ],
+  "stage": "Growth"
+ },
+ {
+  "id": 6,
+  "name": "Remote Rocket",
+  "slug": "remote-rocket",
+  "website": "https://remoterocket.example",
+  "team_size": 8,
+  "isHiring": true,
+  "batch": "Spring 2025",
+  "status": "Active",
+  "regions": [
+   "Fully Remote",
+   "Remote"
+  ],
+  "stage": "Early",
+  "one_liner": "Payroll for remote teams"
+ }
+]
