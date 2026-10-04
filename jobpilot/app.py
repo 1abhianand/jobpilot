@@ -44,7 +44,14 @@ class App:
             raise ConfigError("ANTHROPIC_API_KEY is missing from .env")
         client = AsyncAnthropic(api_key=self.secrets.anthropic_api_key, max_retries=4)
         context = candidate_context(self.settings.profile, self.resume)
-        return LLM(self.settings.llm, self.settings.profile, context, client)
+        llm = LLM(self.settings.llm, self.settings.profile, context, client)
+
+        def record(model: str, dollars: float) -> None:
+            key = f"cost:{self.clock.local().date()}"
+            self.db.put(key, f"{float(self.db.get(key, '0') or 0) + dollars:.6f}")
+
+        llm.on_cost = record
+        return llm
 
     @cached_property
     def bot(self) -> ApprovalBot:

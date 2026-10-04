@@ -14,7 +14,7 @@ from datetime import timedelta
 from functools import partial
 from typing import TYPE_CHECKING
 
-from . import pipeline
+from . import dashboard, pipeline
 from .approvals import esc
 from .browser import LoggedOut
 from .clock import WEEKDAYS, parse
@@ -26,7 +26,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 TICK_SECONDS = 30
+# Quick tasks never open Chrome, so they run in their own loop and are never stuck behind a long site run.
+QUICK = ("cards", "email", "update", "inbox", "expire", "dashboard")
 ALERT_EVERY = timedelta(hours=6)
+TASK_LIMIT = timedelta(minutes=60)  # no single task may hold the browser longer than this
 
 
 @dataclass
@@ -60,6 +63,9 @@ def build_tasks(app: App) -> list[Task]:
         tasks += [Task("inbox", timedelta(minutes=15), pipeline.check_inbox, working_hours=False),
                   Task("followups", timedelta(hours=12), pipeline.draft_followups)]
     tasks.append(Task("expire", timedelta(hours=6), pipeline.expire_cards, working_hours=False))
+    tasks.append(Task("update", timedelta(hours=2), pipeline.send_update))
+    if dashboard.ready(app):
+        tasks.append(Task("dashboard", timedelta(minutes=30), dashboard.publish))
     return tasks
 
 
@@ -78,7 +84,10 @@ async def alert(app: App, key: str, text: str) -> None:
 async def run_task(app: App, task: Task) -> str:
     app.db.put(f"last:{task.name}", app.clock.stamp())  # stamped first, so a crashing task can't spin
     try:
-        summary = await task.run(app)
+        summary = await asyncio.wait_for(task.run(app), timeout=TASK_LIMIT.total_seconds())
+    except asyncio.TimeoutError:
+        log.warning("%s ran past %s and was stopped; it runs again next time", task.name, TASK_LIMIT)
+        return ""
     except LoggedOut as exc:
         log.warning("%s: %s", task.name, exc)
         await alert(app, f"login:{task.name}", f"🔒 {exc}")
@@ -123,15 +132,29 @@ async def tick(app: App, tasks: list[Task]) -> None:
         log.exception("digest failed")
 
 
+async def _loop(app: App, tasks: list[Task], digest: bool) -> None:
+    while True:
+        if digest:
+            await tick(app, tasks)
+        else:
+            for task in tasks:
+                if app.db.get("paused") == "1":
+                    break
+                if due(app, task):
+                    await run_task(app, task)
+        await asyncio.sleep(TICK_SECONDS)
+
+
 async def run_forever(app: App) -> None:
     tasks = build_tasks(app)
+    quick = [t for t in tasks if t.name in QUICK]
+    slow = [t for t in tasks if t.name not in QUICK]
     await pipeline.recover(app)
     mode = "dry run: nothing is really sent" if app.settings.dry_run else "LIVE"
     await app.bot.notify(f"🚀 jobpilot started ({mode}). /status for today's numbers, /pause to stop everything.")
-    listener = asyncio.create_task(app.bot.poll_forever())
+    helpers = [asyncio.create_task(app.bot.poll_forever()), asyncio.create_task(_loop(app, quick, digest=True))]
     try:
-        while True:
-            await tick(app, tasks)
-            await asyncio.sleep(TICK_SECONDS)
+        await _loop(app, slow, digest=False)
     finally:
-        listener.cancel()
+        for helper in helpers:
+            helper.cancel()

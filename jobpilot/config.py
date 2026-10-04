@@ -91,6 +91,7 @@ class LinkedInSettings(SiteSettings):
     send_notes: bool = True
     note_limit: int = 200  # 300 on Premium
     lookups_per_day: int = 8  # company "People" searches for scouted startups
+    attach_resume: bool = False  # attach profile/resume.pdf to LinkedIn messages (connection notes can't carry files)
 
 
 class EmailSettings(BaseModel):
@@ -101,6 +102,10 @@ class EmailSettings(BaseModel):
     max_followups: int = 1
     signature: str = ""
     attach_resume: bool = False
+    # A fixed cold email. Placeholders: {first_name}, {company}, {role}. Empty = Claude writes each one.
+    template_subject: str = ""
+    template_body: str = ""
+    default_role: str = "Software Engineer (Backend / AI)"
 
 
 class YCSettings(BaseModel):
@@ -111,6 +116,7 @@ class YCSettings(BaseModel):
     score_per_day: int = 60
     companies_per_day: int = 6
     min_fit: int = 70
+    priority_regions: list[str] = Field(default_factory=list)  # companies hiring here are contacted first
     job_locations: list[str] = Field(
         default_factory=lambda: [
             r"\b(IN|India|Bengaluru|Bangalore|Hyderabad|Pune|Mumbai|Delhi|Gurugram|Gurgaon|Noida|Chennai)\b",
@@ -123,6 +129,9 @@ class YCSettings(BaseModel):
 class OutreachSettings(BaseModel):
     linkedin_per_company: int = 2  # founders/leaders per company who get a connection request
     email_per_company: int = 1  # ... and who get a cold email
+    # Fixed texts you approved; empty = Claude writes each one. Placeholders in {curly brackets}.
+    connect_template: str = ""  # {first_name}, {company}, {role}
+    apply_note_template: str = ""  # {company}, {role}
 
 
 class ScoutSettings(BaseModel):

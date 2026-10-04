@@ -10,3 +10,18 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+
+# Dashboard snapshot (your application data) and Vercel link
+dashboard/data.json
+dashboard/.vercel/
+
+# Any other env files, anywhere
+.env.*
+**/.env*
+!jobpilot/templates/env.example
+
+# Local databases, logs and OS files
+*.db
+*.db-*
+*.log
+.DS_Store

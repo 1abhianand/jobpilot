@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Job Search Tracker</title>
+<style>
+:root {
+  color-scheme: light;
+  --surface-0: #f4f3f0; --surface-1: #fcfcfb; --surface-2: #f0efec; --border: #e2e0da;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #7a7873;
+  --series-1: #2a78d6; --series-1-soft: #86b6ef; --grid: #e7e5e0;
+  --good: #0ca30c; --warning: #b77a00; --serious: #c85a2e; --critical: #d03b3b;
+  --accent-bg: #e3eefc;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-0: #121211; --surface-1: #1a1a19; --surface-2: #242422; --border: #33332f;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #908f86;
+    --series-1: #3987e5; --series-1-soft: #1c5cab; --grid: #2c2c29;
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #e66767;
+    --accent-bg: #16263b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-0: #121211; --surface-1: #1a1a19; --surface-2: #242422; --border: #33332f;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #908f86;
+  --series-1: #3987e5; --series-1-soft: #1c5cab; --grid: #2c2c29;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #e66767;
+  --accent-bg: #16263b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--surface-0); color: var(--text-primary);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; margin-bottom: 18px; }
+h1 { font-size: 22px; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 10px; }
+.muted { color: var(--text-muted); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  background: var(--surface-2); color: var(--text-secondary); border: 1px solid var(--border); }
+.badge.live { color: var(--good); }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tile .num { font-size: 28px; font-weight: 650; letter-spacing: -0.5px; }
+.tile .label { color: var(--text-secondary); font-size: 13px; }
+.tile .sub { color: var(--text-muted); font-size: 12px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 14px; }
+svg text { fill: var(--text-secondary); font-size: 11px; }
+.bar { fill: var(--series-1); }
+.bar:hover, .hbar:hover .fillbar { opacity: 0.8; }
+.hbars { display: grid; gap: 8px; }
+.hbar { display: grid; grid-template-columns: 130px 1fr 44px; align-items: center; gap: 8px; }
+.hbar .name { color: var(--text-secondary); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hbar .track { height: 14px; }
+.hbar .fillbar { height: 14px; background: var(--series-1); border-radius: 0 4px 4px 0; min-width: 2px; }
+.hbar .val { text-align: right; font-variant-numeric: tabular-nums; }
+#tip { position: fixed; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.15); display: none; z-index: 9; }
+.tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+.tabs button, .filters select, .filters input, .login button, .login input {
+  font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 12px; }
+.tabs button[aria-selected="true"] { background: var(--accent-bg); border-color: var(--series-1); font-weight: 600; }
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.filters input { flex: 1 1 200px; }
+.tablewrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--text-muted); font-weight: 600; font-size: 12px; white-space: nowrap; }
+td.num { font-variant-numeric: tabular-nums; text-align: right; }
+tr.row { cursor: pointer; }
+tr.row:hover td { background: var(--surface-2); }
+tr.detail td { background: var(--surface-2); color: var(--text-secondary); white-space: pre-wrap; }
+a { color: var(--series-1); }
+.status { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; }
+.s-good .dot { background: var(--good); } .s-warn .dot { background: var(--warning); }
+.s-bad .dot { background: var(--critical); } .s-info .dot { background: var(--series-1); }
+.login { max-width: 360px; margin: 18vh auto; }
+.login form { display: flex; gap: 8px; margin-top: 12px; }
+.login input { flex: 1; }
+.login button { background: var(--series-1); color: #fff; border-color: var(--series-1); }
+.err { color: var(--critical); margin-top: 8px; min-height: 1em; }
+.note { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+@media (max-width: 520px) { .hbar { grid-template-columns: 96px 1fr 36px; } .tile .num { font-size: 24px; } }
+</style>
+</head>
+<body>
+<div id="tip" role="tooltip"></div>
+
+<div class="login card" id="login">
+  <h1>Job Search Tracker</h1>
+  <div class="muted">Enter your dashboard password.</div>
+  <form id="loginForm">
+    <input type="password" id="pw" autocomplete="current-password" aria-label="Password" required>
+    <button type="submit">Open</button>
+  </form>
+  <div class="err" id="err"></div>
+</div>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <h1>Job Search Tracker</h1>
+    <span class="badge" id="mode"></span>
+    <span class="muted" id="updated"></span>
+  </header>
+
+  <section class="tiles" id="tiles"></section>
+
+  <section class="grid2">
+    <div class="card"><h2>Applications per day</h2><div id="perDay"></div></div>
+    <div class="card"><h2>Applications by site</h2><div class="hbars" id="bySite"></div></div>
+  </section>
+  <section class="grid2">
+    <div class="card"><h2>Outreach: from draft to reply</h2><div class="hbars" id="funnel"></div>
+      <div class="note">Every email and LinkedIn note is approved by you on Telegram before it is sent.</div></div>
+    <div class="card"><h2>What happened to every job found</h2><div class="hbars" id="jobStatus"></div></div>
+  </section>
+
+  <section class="card">
+    <div class="tabs" role="tablist">
+      <button role="tab" data-tab="apps" aria-selected="true">Applications</button>
+      <button role="tab" data-tab="out" aria-selected="false">Emails &amp; LinkedIn</button>
+      <button role="tab" data-tab="jobs" aria-selected="false">All jobs found</button>
+      <button role="tab" data-tab="cos" aria-selected="false">Companies</button>
+    </div>
+    <div class="filters">
+      <input type="search" id="q" placeholder="Search company, title, person…" aria-label="Search">
+      <select id="fSite" aria-label="Site"></select>
+      <select id="fStatus" aria-label="Status"></select>
+    </div>
+    <div class="tablewrap"><table id="table"></table></div>
+    <div class="note" id="tableNote"></div>
+  </section>
+</div>
+
+<script>
+const SITES = { linkedin: "LinkedIn", instahyre: "Instahyre", hirist: "Hirist", wellfound: "Wellfound", waas: "Work at a Startup" };
+const CHANNELS = { email: "Email", li_connect: "LinkedIn request", li_message: "LinkedIn message", apply_note: "Application note" };
+const JOB_STATUS = {
+  applied: ["Applied", "good"], dry_run: ["Rehearsed (dry run)", "info"], applied_before: ["Applied earlier", "good"],
+  matched: ["Queued to apply", "info"], queued: ["Queued to apply", "info"], awaiting_approval: ["Note waiting on you", "warn"],
+  needs_input: ["Question waiting on you", "warn"], new: ["Not read yet", ""], low_score: ["Poor fit, skipped", ""],
+  filtered: ["Filtered out", ""], unavailable: ["No apply button", ""], failed: ["Failed", "bad"],
+  skipped: ["You skipped", ""], expired: ["Expired", ""],
+};
+const OUT_STATUS = {
+  draft: ["Drafted", ""], pending_approval: ["Waiting on you", "warn"], approved: ["Approved, sending soon", "info"],
+  sending: ["Sending", "info"], sent: ["Sent", "good"], dry_run: ["Rehearsed (dry run)", "info"], waiting: ["Waiting on a question", "warn"],
+  rejected: ["You skipped", ""], failed: ["Failed", "bad"], cancelled: ["Cancelled", ""], expired: ["Expired", ""],
+  bounced: ["Bounced", "bad"], skipped: ["Not needed", ""],
+};
+const DONE = new Set(["applied", "dry_run"]);
+let data, tab = "apps";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const tz = () => data.timezone || "Asia/Kolkata";
+const day = (iso) => iso ? new Date(iso).toLocaleDateString("en-CA", { timeZone: tz() }) : "";
+const when = (iso) => iso ? new Date(iso).toLocaleString("en-IN", { timeZone: tz(), day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "";
+const status = (map, key) => { const [label, cls] = map[key] || [key, ""]; return `<span class="status ${cls ? "s-" + cls : ""}"><span class="dot"></span>${esc(label)}</span>`; };
+
+// -- tooltip -----------------------------------------------------------------------------
+const tip = $("tip");
+function showTip(e, html) { tip.innerHTML = html; tip.style.display = "block"; moveTip(e); }
+function moveTip(e) {
+  const x = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8), y = Math.max(e.clientY - tip.offsetHeight - 10, 8);
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+document.addEventListener("mouseover", (e) => { const t = e.target.closest("[data-tip]"); if (t) showTip(e, t.dataset.tip); });
+document.addEventListener("mousemove", (e) => { if (e.target.closest("[data-tip]")) moveTip(e); });
+document.addEventListener("mouseout", (e) => { if (e.target.closest("[data-tip]")) tip.style.display = "none"; });
+
+// -- login -------------------------------------------------------------------------------
+async function load(password) {
+  const res = await fetch("/api/data", { headers: { "x-dashboard-password": password }, cache: "no-store" });
+  if (res.status === 401) throw new Error("Wrong password.");
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Couldn't load the data.");
+  return res.json();
+}
+async function open(password, remember) {
+  try {
+    data = await load(password);
+    if (remember) try { localStorage.setItem("jp-pw", password); } catch {}
+    $("login").hidden = true; $("app").hidden = false; render();
+  } catch (err) {
+    try { localStorage.removeItem("jp-pw"); } catch {}
+    $("login").hidden = false; $("err").textContent = err.message;
+  }
+}
+$("loginForm").addEventListener("submit", (e) => { e.preventDefault(); open($("pw").value, true); });
+let saved = null; try { saved = localStorage.getItem("jp-pw"); } catch {}
+if (saved) { $("login").hidden = true; open(saved, false); }
+
+// -- charts ------------------------------------------------------------------------------
+function hbars(el, rows, total) {
+  const max = Math.max(1, ...rows.map((r) => r[1]));
+  el.innerHTML = rows.length ? rows.map(([name, n, extra]) => `
+    <div class="hbar" data-tip="<b>${esc(name)}</b><br>${n}${total ? ` (${Math.round(100 * n / Math.max(total, 1))}%)` : ""}${extra ? "<br>" + esc(extra) : ""}">
+      <span class="name" title="${esc(name)}">${esc(name)}</span>
+      <span class="track"><div class="fillbar" style="width:${(100 * n / max).toFixed(1)}%"></div></span>
+      <span class="val">${n}</span></div>`).join("") : `<div class="muted">Nothing yet.</div>`;
+}
+function perDayChart(el, counts) {
+  const days = []; const today = new Date();
+  for (let i = 13; i >= 0; i--) days.push(new Date(today - i * 864e5).toLocaleDateString("en-CA", { timeZone: tz() }));
+  const vals = days.map((d) => counts[d] || 0), max = Math.max(4, ...vals);
+  const W = 520, H = 190, L = 28, B = 24, T = 8, bw = (W - L) / days.length;
+  const y = (v) => T + (H - T - B) * (1 - v / max);
+  const ticks = [0, Math.round(max / 2), max];
+  let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Applications per day, last 14 days">`;
+  for (const t of ticks) svg += `<line x1="${L}" x2="${W}" y1="${y(t)}" y2="${y(t)}" stroke="var(--grid)"/><text x="${L - 6}" y="${y(t) + 4}" text-anchor="end">${t}</text>`;
+  days.forEach((d, i) => {
+    const x = L + i * bw, v = vals[i], label = new Date(d + "T12:00").toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+    if (v) {
+      const top = y(v), h = y(0) - top, r = Math.min(4, h), w = bw - 6, x0 = x + 3;
+      svg += `<path class="bar" d="M${x0},${y(0)} V${top + r} Q${x0},${top} ${x0 + r},${top} H${x0 + w - r} Q${x0 + w},${top} ${x0 + w},${top + r} V${y(0)} Z"/>`;
+    }
+    svg += `<rect x="${x}" y="${T}" width="${bw}" height="${H - T - B}" fill="transparent" data-tip="<b>${label}</b><br>${v} application${v === 1 ? "" : "s"}"/>`;
+    if (i % 2 === 1 || days.length < 8) svg += `<text x="${x + bw / 2}" y="${H - 6}" text-anchor="middle">${label}</text>`;
+  });
+  el.innerHTML = svg + "</svg>";
+}
+
+// -- render ------------------------------------------------------------------------------
+function render() {
+  const { jobs, outreach } = data, dry = data.mode !== "live";
+  $("mode").textContent = dry ? "Dry run: nothing really sent" : "Live";
+  $("mode").className = "badge" + (dry ? "" : " live");
+  $("updated").textContent = "Updated " + when(data.generated_at);
+
+  const applied = jobs.filter((j) => DONE.has(j.status));
+  const today = day(new Date().toISOString());
+  const sent = outreach.filter((o) => ["sent", "dry_run"].includes(o.status));
+  const realSent = outreach.filter((o) => o.status === "sent");
+  const replies = outreach.filter((o) => o.replied_at);
+  const accepted = new Set(outreach.filter((o) => o.channel === "li_connect" && ["connected", "messaged"].includes(o.li_state)).map((o) => o.to));
+  const waiting = outreach.filter((o) => o.status === "pending_approval").length + jobs.filter((j) => j.status === "needs_input").length;
+  const tiles = [
+    [applied.length, "Applications", `${applied.filter((j) => day(j.applied_at) === today).length} today`],
+    [sent.length, "Emails & LinkedIn sent", `${sent.filter((o) => o.channel === "email").length} emails`],
+    [replies.length, "Replies", realSent.length ? `${Math.round(100 * replies.length / realSent.length)}% reply rate` : "reply rate after live sends"],
+    [accepted.size, "Connections accepted", "LinkedIn requests"],
+    [waiting, "Waiting on you", "cards & form questions"],
+    [jobs.length, "Jobs found", `${jobs.filter((j) => j.status === "low_score").length} poor fits skipped`],
+  ];
+  $("tiles").innerHTML = tiles.map(([n, label, sub]) => `<div class="card tile"><div class="num">${n}</div><div class="label">${esc(label)}</div><div class="sub">${esc(sub)}</div></div>`).join("");
+
+  const perDay = {}; applied.forEach((j) => { const d = day(j.applied_at); perDay[d] = (perDay[d] || 0) + 1; });
+  perDayChart($("perDay"), perDay);
+  const bySite = {}; applied.forEach((j) => bySite[j.site] = (bySite[j.site] || 0) + 1);
+  hbars($("bySite"), Object.entries(bySite).sort((a, b) => b[1] - a[1]).map(([s, n]) => [SITES[s] || s, n]), applied.length);
+
+  const firsts = outreach.filter((o) => !o.followup && o.channel !== "apply_note");
+  const stage = (pred) => firsts.filter(pred).length;
+  hbars($("funnel"), [
+    ["Drafted", firsts.length],
+    ["Approved by you", stage((o) => o.approved_at || ["sent", "dry_run"].includes(o.status))],
+    ["Sent", stage((o) => ["sent", "dry_run"].includes(o.status))],
+    ["Replied / accepted", stage((o) => o.replied_at || (o.channel === "li_connect" && ["connected", "messaged"].includes(o.li_state)))],
+  ]);
+  const byStatus = {}; jobs.forEach((j) => { const label = (JOB_STATUS[j.status] || [j.status])[0]; byStatus[label] = (byStatus[label] || 0) + 1; });
+  hbars($("jobStatus"), Object.entries(byStatus).sort((a, b) => b[1] - a[1]), jobs.length);
+
+  setupFilters(); drawTable();
+}
+
+const TABLES = {
+  apps: {
+    rows: () => data.jobs.filter((j) => DONE.has(j.status) || ["awaiting_approval", "needs_input", "failed", "matched", "queued"].includes(j.status)),
+    site: (r) => r.site, status: (r) => r.status, statusMap: JOB_STATUS,
+    head: ["Job", "Company", "Site", "Fit", "Status", "Applied"],
+    cells: (r) => [`<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title || "Job")}</a>`, esc(r.company), esc(SITES[r.site] || r.site),
+      `<span class="num">${r.score ?? ""}</span>`, status(JOB_STATUS, r.status), esc(when(r.applied_at))],
+    detail: (r) => [r.reason && `Why this fit score: ${r.reason}`, r.location && `Location: ${r.location}`,
+      r.question && `Waiting for your answer to: ${r.question}`, r.error && `Problem: ${r.error}`, `Found ${when(r.discovered_at)}`].filter(Boolean).join("\n"),
+    note: "Job sites don't tell jobpilot when a recruiter responds; replies to your emails appear under Emails & LinkedIn.",
+  },
+  out: {
+    rows: () => data.outreach.filter((o) => o.channel !== "apply_note"),
+    site: (r) => r.channel, siteMap: CHANNELS, status: (r) => r.replied_at ? "__replied" : r.status,
+    statusMap: { ...OUT_STATUS, __replied: ["Replied", "good"] },
+    head: ["Person", "Company", "Channel", "Status", "Sent", "Reply"],
+    cells: (r) => [esc(r.person || r.to) + (r.person_title ? `<div class="muted">${esc(r.person_title)}</div>` : ""),
+      esc(r.company) + (r.yc_batch ? ` <span class="muted">YC ${esc(r.yc_batch)}</span>` : ""),
+      esc(CHANNELS[r.channel]) + (r.followup ? " (follow-up)" : ""), status(OUT_STATUS, r.status), esc(when(r.sent_at)),
+      r.replied_at ? `<span class="status s-good"><span class="dot"></span>${esc(when(r.replied_at))}</span>`
+        : r.channel === "li_connect" && ["connected", "messaged"].includes(r.li_state) ? `<span class="status s-good"><span class="dot"></span>Accepted</span>` : ""],
+    detail: (r) => [r.to && `To: ${r.to}${r.email_source === "guess" ? " (guessed address)" : ""}`, r.subject && `Subject: ${r.subject}`,
+      r.body, r.error && `Problem: ${r.error}`].filter(Boolean).join("\n"),
+    note: "Message text is shown once it has been sent.",
+  },
+  jobs: {
+    rows: () => data.jobs, site: (r) => r.site, status: (r) => r.status, statusMap: JOB_STATUS,
+    head: ["Job", "Company", "Site", "Fit", "Status", "Found"],
+    cells: (r) => [`<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title || "Job")}</a>`, esc(r.company), esc(SITES[r.site] || r.site),
+      `<span class="num">${r.score ?? ""}</span>`, status(JOB_STATUS, r.status), esc(when(r.discovered_at))],
+    detail: (r) => [r.reason, r.error && `Problem: ${r.error}`].filter(Boolean).join("\n"),
+    note: "",
+  },
+  cos: {
+    rows: () => data.companies, site: (r) => r.source, siteMap: { yc: "Y Combinator", scout: "Found by web search" },
+    status: (r) => r.status, statusMap: { target: ["To contact", "info"], drafted: ["Contacted / drafted", "good"], pass: ["Passed", ""] },
+    head: ["Company", "Source", "Fit", "Stage", "Status"],
+    cells: (r) => [r.website ? `<a href="${esc(r.website)}" target="_blank" rel="noopener">${esc(r.name)}</a>` : esc(r.name),
+      r.source === "yc" ? `YC ${esc(r.yc_batch || "")}` : "Web search", `<span class="num">${r.fit ?? ""}</span>`, esc(r.stage),
+      status({ target: ["To contact", "info"], drafted: ["Contacted / drafted", "good"], pass: ["Passed", ""] }, r.status)],
+    detail: (r) => [r.fit_reason, r.location && `Location: ${r.location}`].filter(Boolean).join("\n"),
+    note: "",
+  },
+};
+
+function setupFilters() {
+  const t = TABLES[tab], rows = t.rows();
+  const sites = [...new Set(rows.map(t.site).filter(Boolean))];
+  const statuses = [...new Set(rows.map(t.status).filter(Boolean))];
+  const siteName = (s) => (t.siteMap || SITES)[s] || s, statusName = (s) => (t.statusMap[s] || [s])[0];
+  $("fSite").innerHTML = `<option value="">All ${tab === "out" ? "channels" : tab === "cos" ? "sources" : "sites"}</option>` +
+    sites.map((s) => `<option value="${esc(s)}">${esc(siteName(s))}</option>`).join("");
+  $("fStatus").innerHTML = `<option value="">All statuses</option>` + statuses.map((s) => `<option value="${esc(s)}">${esc(statusName(s))}</option>`).join("");
+  $("tableNote").textContent = t.note;
+}
+function drawTable() {
+  const t = TABLES[tab], q = $("q").value.trim().toLowerCase(), fs = $("fSite").value, fst = $("fStatus").value;
+  const rows = t.rows().filter((r) => (!fs || t.site(r) === fs) && (!fst || t.status(r) === fst) &&
+    (!q || JSON.stringify(r).toLowerCase().includes(q)));
+  const shown = rows.slice(0, 400);
+  $("table").innerHTML = `<thead><tr>${t.head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>` +
+    (shown.length ? shown.map((r, i) => `<tr class="row" data-i="${i}" tabindex="0" aria-expanded="false">${t.cells(r).map((c) => `<td>${c ?? ""}</td>`).join("")}</tr>`).join("")
+      : `<tr><td colspan="${t.head.length}" class="muted">Nothing here yet.</td></tr>`) + "</tbody>";
+  $("table").onclick = $("table").onkeydown = (e) => {
+    if (e.type === "keydown" && e.key !== "Enter") return;
+    if (e.target.closest("a")) return;
+    const tr = e.target.closest("tr.row"); if (!tr) return;
+    const next = tr.nextElementSibling;
+    if (next && next.classList.contains("detail")) { next.remove(); tr.setAttribute("aria-expanded", "false"); return; }
+    const text = t.detail(shown[+tr.dataset.i]) || "No more details.";
+    tr.insertAdjacentHTML("afterend", `<tr class="detail"><td colspan="${t.head.length}">${esc(text)}</td></tr>`);
+    tr.setAttribute("aria-expanded", "true");
+  };
+  if (rows.length > shown.length) $("tableNote").textContent = `Showing the first ${shown.length} of ${rows.length}. Use search to narrow it down.`;
+}
+document.querySelectorAll("[data-tab]").forEach((b) => b.addEventListener("click", () => {
+  tab = b.dataset.tab;
+  document.querySelectorAll("[data-tab]").forEach((x) => x.setAttribute("aria-selected", String(x === b)));
+  $("q").value = ""; setupFilters(); drawTable();
+}));
+["q", "fSite", "fStatus"].forEach((id) => $(id).addEventListener("input", drawTable));
+</script>
+</body>
+</html>

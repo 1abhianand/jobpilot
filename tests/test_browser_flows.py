@@ -219,6 +219,7 @@ def profile(name: str = "Mavi Kapoor", degree: str = "2nd", pending: bool = Fals
 <div id="toast" role="alert" style="display:none">Invitation sent to {name}</div>
 <div id="chat" style="display:none"><div class="msg-list"></div>
   <div class="msg-form__contenteditable" contenteditable="true" role="textbox"></div>
+  <form class="msg-form"><input type="file" id="attach" style="display:none"></form>
   <button class="msg-form__send-button" onclick="sendMessage()">Send</button>
   <button aria-label="Close your conversation with {name}" onclick="this.parentElement.style.display='none'">x</button></div>
 <script>
@@ -280,9 +281,12 @@ async def test_connect_without_note_and_pending_profiles(page, filler):
 async def test_message_after_they_accept(page, filler):
     await serve(page, {PROFILE_URL: profile(degree="1st"), "https://www.linkedin.com/in/stranger/": profile()})
     site = LinkedIn(filler)
-    reach, _ = await site.message(page, PROFILE_URL, "Mavi Kapoor", "Thanks for connecting, Mavi.", dry_run=False)
-    assert reach is Reach.SENT
+    resume = filler.resume
+    reach, detail = await site.message(page, PROFILE_URL, "Mavi Kapoor", "Thanks for connecting, Mavi.", dry_run=False,
+                                       attachment=resume)
+    assert reach is Reach.SENT and "attached resume.pdf" in detail
     assert await page.evaluate("window.sentMessage") == "Thanks for connecting, Mavi."
+    assert await page.evaluate("document.getElementById('attach').files[0].name") == "resume.pdf"
     reach, _ = await site.message(page, "https://www.linkedin.com/in/stranger/", "Mavi Kapoor", "Hi", dry_run=False)
     assert reach is Reach.NOT_CONNECTED
 
@@ -292,6 +296,12 @@ async def test_logged_out_is_reported(page, filler):
                        "https://www.linkedin.com/authwall": "<html><body>Sign in</body></html>"})
     with pytest.raises(LoggedOut):
         await LinkedIn(filler).member(page, PROFILE_URL)
+
+
+def test_profile_urls_use_www():
+    from jobpilot.sites.linkedin import profile_url
+    assert profile_url("https://in.linkedin.com/in/aayush-rai") == "https://www.linkedin.com/in/aayush-rai/"
+    assert profile_url("https://www.linkedin.com/in/dev?trk=x") == "https://www.linkedin.com/in/dev/"
 
 
 def test_names_match():

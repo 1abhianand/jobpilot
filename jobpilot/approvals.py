@@ -77,6 +77,8 @@ def summary(db: DB, clock: Clock, settings: Settings) -> str:
     lines.append(f"Waiting on you: {db.count_outreach('pending_approval')} cards, "
                  f"{db.count_jobs('needs_input')} form questions")
     lines.append(f"Approved, queued to send: {db.count_outreach('approved')}")
+    spent = float(db.get(f"cost:{clock.local().date()}", "0") or 0)
+    lines.append(f"Claude API cost today: ${spent:.2f}")
     if db.get("paused") == "1":
         lines.append("⏸ Paused. /resume to continue.")
     return "\n".join(lines)

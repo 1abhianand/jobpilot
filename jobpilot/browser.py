@@ -58,6 +58,8 @@ TEXT_JS = """(pattern) => {
   const tags = 'button, a, span, div, p, li, h1, h2, h3, h4, [role=status], [role=alert]';
   for (const el of document.querySelectorAll(tags)) {
     if (el.childElementCount > 3) continue;
+    // a status line is never a menu entry: skip navigation (Wellfound's sidebar has an "Applied" link)
+    if (el.closest('nav, header, a[href]:not([href="#"])')) continue;
     const text = (el.innerText || '').trim();
     if (!text || text.length > 160 || !re.test(text)) continue;
     const box = el.getBoundingClientRect();

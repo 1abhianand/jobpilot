@@ -45,7 +45,18 @@ SCAN_JS = r"""(root) => {
     }
     return [clean(el.getAttribute('placeholder') || el.getAttribute('name') || ''), null];
   };
+  const optionText = r => {  // 2026 LinkedIn: empty <label>, the option's words sit in a sibling <p>
+    const own = r.labels && r.labels.length ? clean(r.labels[0].innerText) : '';
+    if (own) return own;
+    for (let n = r.parentElement; n && n !== root && n.querySelectorAll('input[type=radio]').length === 1; n = n.parentElement) {
+      const t = clean(n.innerText); if (t) return t;
+    }
+    return clean(r.value);
+  };
   const groupLabel = (radios, options) => {
+    const shared = clean(radios[0].getAttribute('aria-label'));  // the question, repeated on every option
+    if (shared && radios.every(r => clean(r.getAttribute('aria-label')) === shared) && !options.includes(shared))
+      return [shared, radios[0].closest('fieldset, [role=radiogroup]')];
     const fs = radios[0].closest('fieldset'); const legend = fs && fs.querySelector('legend');
     if (legend && clean(legend.innerText)) return [clean(legend.innerText), legend];
     const group = radios[0].closest('[role=radiogroup]');
@@ -75,7 +86,7 @@ SCAN_JS = r"""(root) => {
       seenGroups.add(el.name);
       const radios = [...root.querySelectorAll('input[type=radio]')].filter(r => r.name === el.name);
       if (!radios.some(r => shown(r) || (r.labels && shown(r.labels[0])))) continue;
-      const options = radios.map(r => clean(r.labels && r.labels.length ? r.labels[0].innerText : r.value));
+      const options = radios.map(optionText);
       const [label, holder] = groupLabel(radios, options);
       radios.forEach((r, j) => { r.setAttribute('data-jp-field', idx); r.setAttribute('data-jp-opt', j); });
       fields.push({idx, kind: 'radio', label, options, value: radios.some(r => r.checked) ? 'checked' : '',
@@ -181,7 +192,7 @@ def money(value: str, question: str) -> str | None:
     """'24 LPA' stays as is, unless the form asks in rupees: then 2400000."""
     if not value:
         return None
-    asks_rupees = re.search(r"\b(inr|rupees?|per annum|annual)\b|₹", question, re.IGNORECASE)
+    asks_rupees = re.search(r"\b(inr|rupees?)\b|₹", question, re.IGNORECASE)  # "annual CTC" still means lakhs
     asks_lakhs = re.search(r"\b(lakhs?|lacs?|lpa)\b", question, re.IGNORECASE)
     amount = re.search(r"\d+(?:\.\d+)?", value.replace(",", ""))
     if asks_rupees and not asks_lakhs and amount and re.search(r"\b(lpa|lakhs?|lacs?|l)\b", value, re.IGNORECASE):
@@ -214,10 +225,12 @@ def from_profile(profile: Profile, field: Field) -> str | None:
     if "notice period" in q or re.search(r"\b(when can you (start|join)|availability to (start|join))\b", q):
         days = profile.notice_period_days
         return "Immediately" if days == 0 and field.kind in ("radio", "select") else f"{days} days"
-    if re.search(r"\b(current|present|existing) (ctc|salary|compensation|pay|package)\b", q):
-        return money(profile.current_ctc, q)
-    if re.search(r"\b(expected|desired) (ctc|salary|compensation|pay|package)\b|salary expectation", q):
+    pay = r"(ctc|salary|compensation|pay|package|remuneration)"
+    # "current annual CTC", "present fixed salary", "current CTC (in LPA)"
+    if re.search(rf"\b(expected|desired)\b(\s+\w+){{0,2}}\s+{pay}\b|salary expectation|\bectc\b", q):
         return money(profile.expected_ctc, q)
+    if re.search(rf"\b(current|present|existing|last drawn)\b(\s+\w+){{0,2}}\s+{pay}\b|\bcctc\b", q) or re.fullmatch(rf"\s*{pay}\s*\??\s*", q):
+        return money(profile.current_ctc, q)
     if re.search(r"\b(current city|current location|where are you (currently )?(based|located))\b", q) or q.strip() in (
             "city", "location", "location (city)"):
         return profile.city or None
@@ -276,6 +289,12 @@ class FormFiller:
             element = root.locator(f'[data-jp-field="{field.idx}"]').first
             if field.kind == "checkbox":
                 await self._checkbox(element, field)
+                continue
+            if field.value and field.kind == "select" and re.search(r"\be-?mail\b", field.label, re.I):
+                wanted = self.book.profile.email.lower()
+                match = next((o for o in field.options if o.lower() == wanted), None)
+                if match and field.value.lower() != wanted:  # LinkedIn preselects whichever address it likes
+                    await element.select_option(label=match)
                 continue
             if field.value:
                 continue

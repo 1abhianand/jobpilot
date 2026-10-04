@@ -174,3 +174,17 @@ async def test_email_finder_prefers_hunter_then_guesses(monkeypatch):
     assert await finder.find("Dev Patel", "lowscore.example") == ("dev@lowscore.example", "guess")
     assert await finder.find("Dev Patel", "nomail.example") == (None, "domain takes no email")
     assert (await EmailFinder(http).find("", "acme.example"))[0] is None
+
+
+@pytest.mark.parametrize("question, kind, expected", [
+    ("What is your current CTC?", "text", "30 LPA"),
+    ("What is your current Salary ?", "text", "30 LPA"),
+    ("what is your current annual CTC?", "text", "30 LPA"),
+    ("Please enter your current ctc in INR", "number", "3000000"),
+    ("Current CTC (in LPA)", "number", "30"),
+    ("What is your expected CTC?", "text", "40 LPA"),
+])
+def test_every_ctc_wording_gets_your_answer(question, kind, expected):
+    from jobpilot.forms import Field, fit, from_profile
+    field = Field(0, kind, question, True, [], "")
+    assert fit(from_profile(make_settings().profile, field), field) == expected

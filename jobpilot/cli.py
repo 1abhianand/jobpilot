@@ -12,7 +12,7 @@ from collections.abc import Awaitable
 from importlib import resources
 from pathlib import Path
 
-from . import yc
+from . import dashboard, yc
 from .app import App
 from .approvals import summary
 from .browser import LoggedOut
@@ -262,6 +262,16 @@ def requeue(app: App) -> int:
     return 0
 
 
+async def publish_dashboard(app: App) -> int:
+    path = dashboard.export(app)
+    if not dashboard.ready(app):
+        print(f"Wrote {path}. To publish it: install the Vercel CLI (npm i -g vercel), then in dashboard/ run "
+              "`vercel login` and `vercel link` (see dashboard/README.md).")
+        return 0
+    print(await dashboard.publish(app))
+    return 0
+
+
 async def _run(app: App, work: Awaitable[int]) -> int:
     try:
         return await work
@@ -287,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("status", help="today's numbers")
     answers_cmd = commands.add_parser("answers", help="list saved form answers, or forget one")
     answers_cmd.add_argument("--forget", metavar="QUESTION")
+    commands.add_parser("dashboard", help="publish the Vercel dashboard now (it also updates every 30 minutes)")
     commands.add_parser("requeue", help="after switching to live: redo what the dry run only rehearsed")
     args = parser.parse_args(argv)
 
@@ -309,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
             "doctor": lambda: doctor(app, args.site),
             "run": lambda: _forever(app),
             "once": lambda: once(app, args.task),
+            "dashboard": lambda: publish_dashboard(app),
         }[args.command]()
         return asyncio.run(_run(app, work))
     except ConfigError as exc:

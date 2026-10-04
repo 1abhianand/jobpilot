@@ -7,17 +7,22 @@ meant to reach. In dry-run mode nothing that could send is ever clicked.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from pathlib import Path
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import Locator, Page
 
 from ..browser import close_dialogs, first_visible, goto, page_text, pause, scroll, text_matching, top_dialog, type_text
 from ..forms import FormFiller
 from .base import ApplyResult, JobPage, JobStub, Outcome
+
+log = logging.getLogger(__name__)
 
 JOB_IDS_JS = r"""() => {
   const ids = new Set();
@@ -79,6 +84,14 @@ ERRORS_JS = r"""(root) => {
     const label = holder && holder.querySelector('label, legend');
     out.push({label: label ? label.innerText.trim().split('\n')[0] : '', message});
   }
+  // 2026 layout: the message sits in the element named by the field's aria-describedby ("Invalid input")
+  for (const field of root.querySelectorAll('input, textarea, select')) {
+    const ids = (field.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean);
+    const said = ids.map(id => (document.getElementById(id) || {}).innerText || '').join(' ').trim();
+    if (!/invalid|required|enter a|must be|please/i.test(said)) continue;
+    const label = field.labels && field.labels.length ? field.labels[0].innerText.trim().split('\n')[0] : '';
+    out.push({label, message: said.split('\n')[0], value: field.value || '', jp: field.getAttribute('data-jp-field')});
+  }
   return out;
 }"""
 
@@ -136,6 +149,8 @@ def with_start(url: str, start: int) -> str:
 
 
 def profile_url(url: str) -> str:
+    """Canonical profile URL. Country hosts (in.linkedin.com) fail to load for a logged-in member, so use www."""
+    url = re.sub(r"^https?://([a-z]{2,3}\.)?linkedin\.com", "https://www.linkedin.com", url.strip(), flags=re.IGNORECASE)
     return url.split("?")[0].rstrip("/") + "/"
 
 
@@ -154,23 +169,29 @@ class LinkedIn:
     async def discover(self, page: Page, urls: list[str], limit: int) -> list[JobStub]:
         ids: list[str] = []
         for index, url in enumerate(urls):
-            # Each search gets a fair share of what's left, so the first one can't crowd out the rest.
-            share = -(-(limit - len(ids)) // (len(urls) - index))
-            taken = 0
-            for start in range(0, 250, 25):
-                if taken >= share:
-                    break
-                await goto(page, with_start(url, start))
-                for _ in range(6):
-                    await page.evaluate(SCROLL_LIST_JS)
-                    await pause(0.5, 1.0)
-                fresh = [i for i in await page.evaluate(JOB_IDS_JS) if i not in ids]
-                if not fresh:
-                    break
-                fresh = fresh[: share - taken]
-                ids.extend(fresh)
-                taken += len(fresh)
+            try:  # one hung search page once blocked everything for 5 hours; give each search 4 minutes
+                await asyncio.wait_for(self._search(page, url, ids, limit, len(urls) - index), timeout=240)
+            except asyncio.TimeoutError:
+                log.warning("LinkedIn search took over 4 minutes, moving on: %s", url[:120])
         return [JobStub(i, f"https://www.linkedin.com/jobs/view/{i}/") for i in ids[:limit]]
+
+    async def _search(self, page: Page, url: str, ids: list[str], limit: int, urls_left: int) -> None:
+        # Each search gets a fair share of what's left, so the first one can't crowd out the rest.
+        share = -(-(limit - len(ids)) // urls_left)
+        taken = 0
+        for start_at in range(0, 250, 25):
+            if taken >= share:
+                break
+            await goto(page, with_start(url, start_at))
+            for _ in range(6):
+                await page.evaluate(SCROLL_LIST_JS)
+                await pause(0.5, 1.0)
+            fresh = [i for i in await page.evaluate(JOB_IDS_JS) if i not in ids]
+            if not fresh:
+                break
+            fresh = fresh[: share - taken]
+            ids.extend(fresh)
+            taken += len(fresh)
 
     async def _easy_apply(self, page: Page) -> Locator | None:
         return await first_visible(page.get_by_role("button", name=EASY_APPLY))
@@ -195,11 +216,26 @@ class LinkedIn:
 
     async def _modal(self, page: Page) -> Locator | None:
         for _ in range(10):
-            modal = await first_visible(page.locator(".jobs-easy-apply-modal"), page.locator("[role='dialog']"))
+            modal = await first_visible(page.locator(".jobs-easy-apply-modal"), page.locator("[role='dialog']"),
+                                        page.locator("dialog[open]"), page.locator("dialog"))  # a <dialog> since 2026
             if modal is not None:
                 return modal
             await pause(0.5, 0.8)
         return None
+
+    async def _numbers_only(self, modal: Locator, errors: list[dict]) -> bool:
+        """A field rejected "45 days" often wants just "45": retry with the number, and remember it."""
+        fixed = False
+        for error in errors:
+            value = error.get("value") or ""
+            number = re.search(r"\d+(?:\.\d+)?", value.replace(",", ""))
+            if error.get("jp") is None or not number or number.group() == value.strip():
+                continue
+            await modal.locator(f'[data-jp-field="{error["jp"]}"]').first.fill(number.group())
+            if error.get("label"):
+                self.filler.book.db.learn_answer(error["label"], number.group(), "you")
+            fixed = True
+        return fixed
 
     async def _discard(self, page: Page) -> None:
         modal = await top_dialog(page)
@@ -252,9 +288,18 @@ class LinkedIn:
             if step is None:
                 await self._discard(page)
                 return ApplyResult(Outcome.FAILED, "no Next, Review or Submit button in the form")
+            before = (await modal.inner_text())[:300]
             await step.click()
             await pause(1.2, 2.2)
             errors = await modal.evaluate(ERRORS_JS)
+            if errors and await self._numbers_only(modal, errors):
+                step = await first_visible(modal.get_by_role("button", name=NEXT_STEP))
+                if step is not None:
+                    await step.click()
+                    await pause(1.2, 2.2)
+                errors = await modal.evaluate(ERRORS_JS)
+            if not errors and (await modal.inner_text())[:300] == before:
+                errors = [{"label": "", "message": "the page didn't change after Next"}]  # an error we can't read
             if errors:
                 stuck += 1
                 if stuck >= 2:
@@ -269,25 +314,39 @@ class LinkedIn:
 
     # -- people ---------------------------------------------------------------------------
 
+    @staticmethod
+    def _missing(page: Page) -> str:
+        if "/404" in page.url:
+            return "this LinkedIn profile doesn't exist any more (the link we had is out of date)"
+        return "profile didn't load"
+
     async def _top_card(self, page: Page) -> Locator:
-        card = page.locator("main section").filter(has=page.locator("h1")).first
+        # The 2026 layout puts the whole profile in one "Primary content" region with the name as an h2.
+        card = page.locator("main section, main [role='region']").filter(has=page.locator("h1, h2")).first
         return card if await card.count() else page.locator("main").first
 
     async def member(self, page: Page, url: str) -> Member | None:
         await goto(page, profile_url(url))
-        heading = await first_visible(page.locator("main h1"))
+        heading = None
+        for _ in range(3):  # the profile renders after the page itself has loaded
+            heading = await first_visible(page.locator("main h1"), page.locator("main a[href*='/in/'] h2"),
+                                          page.locator("main h2"))
+            if heading is not None:
+                break
+            await pause(1.5, 2.5)
         if heading is None:
             return None
         top = await self._top_card(page)
-        text = await top.inner_text()
-        pending = await first_visible(top.get_by_role("button", name=re.compile(r"^pending", re.IGNORECASE)))
+        text = (await top.inner_text())[:500]  # name, degree and headline come first; posts further down mention "1st" too
+        pending_name = re.compile(r"^pending", re.IGNORECASE)  # a button before 2026, a link since
+        pending = await first_visible(top.get_by_role("button", name=pending_name), top.get_by_role("link", name=pending_name))
         return Member(name=(await heading.inner_text()).strip(), connected=FIRST_DEGREE.search(text) is not None,
                       pending=pending is not None)
 
     async def connect(self, page: Page, url: str, expected: str, note: str, dry_run: bool) -> tuple[Reach, str]:
         who = await self.member(page, url)
         if who is None:
-            return Reach.UNAVAILABLE, "profile didn't load"
+            return Reach.UNAVAILABLE, self._missing(page)
         if not names_match(expected, who.name):
             return Reach.NAME_MISMATCH, f"the profile belongs to {who.name!r}"
         if who.pending:
@@ -309,7 +368,8 @@ class LinkedIn:
             await pause(0.6, 1.2)
             button = await first_visible(page.get_by_role("button", name=invite),
                                          page.get_by_role("menuitem", name=invite),
-                                         page.locator(f'[aria-label="Invite {css_name} to connect" i]'))
+                                         page.locator(f'[aria-label="Invite {css_name} to connect" i]'),
+                                         page.get_by_role("menuitem", name=re.compile(r"^connect$", re.IGNORECASE)))
         if button is None:
             if opened_menu:
                 await page.keyboard.press("Escape")
@@ -318,7 +378,12 @@ class LinkedIn:
             if opened_menu:
                 await page.keyboard.press("Escape")
             return Reach.DRY_RUN, "found the Connect button; stopped before clicking it"
-        await button.click()
+        href = await button.get_attribute("href")
+        if href and "invite" in href:
+            # The 2026 Connect is a link to the invite window; open it rather than click through overlays.
+            await goto(page, urljoin("https://www.linkedin.com/", href))
+        else:
+            await button.click()
         await pause(1.0, 2.0)
         dialog = await top_dialog(page)
         if dialog is None:
@@ -365,10 +430,11 @@ class LinkedIn:
             return Reach.SENT, ""
         return Reach.FAILED, "clicked Send but couldn't confirm; check the profile"
 
-    async def message(self, page: Page, url: str, expected: str, text: str, dry_run: bool) -> tuple[Reach, str]:
+    async def message(self, page: Page, url: str, expected: str, text: str, dry_run: bool,
+                      attachment: Path | None = None) -> tuple[Reach, str]:
         who = await self.member(page, url)
         if who is None:
-            return Reach.UNAVAILABLE, "profile didn't load"
+            return Reach.UNAVAILABLE, self._missing(page)
         if not names_match(expected, who.name):
             return Reach.NAME_MISMATCH, f"the profile belongs to {who.name!r}"
         if not who.connected:
@@ -389,6 +455,16 @@ class LinkedIn:
         await box.click()
         await box.fill(text)  # fill, not key presses: Enter may send mid-message
         await pause(0.8, 1.5)
+        attached = ""
+        if attachment is not None:
+            chooser = page.locator(".msg-form input[type='file'], form.msg-form__form input[type='file'], "
+                                   "[class*='msg-form'] input[type='file']")
+            if await chooser.count():
+                await chooser.first.set_input_files(str(attachment))
+                await pause(3.0, 5.0)  # the upload finishes before Send is usable again
+                attached = f"attached {attachment.name}"
+            else:
+                attached = "couldn't find the attach button, so the message went without your resume"
         send = await first_visible(page.locator("button.msg-form__send-button"),
                                    page.get_by_role("button", name=re.compile(r"^send$", re.IGNORECASE)))
         if send is None or await send.is_disabled():
@@ -401,7 +477,7 @@ class LinkedIn:
         for close in await page.locator("button[aria-label^='Close your' i]").all():
             if await close.is_visible():
                 await close.click()
-        return (Reach.SENT, "") if sent else (Reach.FAILED, "couldn't confirm the message went out")
+        return (Reach.SENT, attached) if sent else (Reach.FAILED, "couldn't confirm the message went out")
 
     async def company_url(self, page: Page, company: str) -> str | None:
         await goto(page, f"https://www.linkedin.com/search/results/companies/?keywords={quote(company)}")

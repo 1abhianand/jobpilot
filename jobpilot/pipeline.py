@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 BROWSER_CHANNELS = ("li_connect", "li_message", "apply_note")
 ACTION_GAPS = {"li_connect": (90, 240), "li_message": (60, 180), "apply_note": (45, 120)}  # seconds
-ACTIONS_PER_SESSION = 8
+ACTIONS_PER_SESSION = 15
 OPEN = ("draft", "pending_approval", "approved", "sending", "waiting")
 FATAL_API_ERRORS = (anthropic.AuthenticationError, anthropic.PermissionDeniedError, anthropic.NotFoundError)
 PROFILE_URL = re.compile(r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[^/?#\s]+", re.IGNORECASE)
@@ -242,9 +242,18 @@ def _unsigned(app: App, body: str) -> str:
     return body
 
 
+def note_from_template(app: App, job: sqlite3.Row, company: sqlite3.Row | None) -> str:
+    name = (company["name"] if company else None) or job["company"] or "your"
+    role = (job["title"] or app.settings.email.default_role).strip()
+    return app.settings.outreach.apply_note_template.format_map({"company": name, "role": role}).strip()
+
+
 async def draft_application_note(app: App, job: sqlite3.Row) -> int:
     company = app.db.company(meta(job).get("company_id"))
-    draft = await app.llm.write("apply_note", company=_company_text(company) or None, job=_job_text(job))
+    if app.settings.outreach.apply_note_template:
+        draft = Draft(subject=None, body=note_from_template(app, job, company))
+    else:
+        draft = await app.llm.write("apply_note", company=_company_text(company) or None, job=_job_text(job))
     return app.db.add_outreach("apply_note", draft.body, job_id=job["id"], to_addr=job["url"],
                                company_id=company["id"] if company else None)
 
@@ -253,12 +262,45 @@ async def draft_connect(app: App, person: sqlite3.Row, company: sqlite3.Row) -> 
     if not person["linkedin_url"] or app.db.has_outreach("li_connect", person_id=person["id"]):
         return None
     note = ""
-    if app.settings.linkedin.send_notes:
+    if app.settings.linkedin.send_notes and app.settings.outreach.connect_template:
+        note = connect_note(app, person, company)
+    elif app.settings.linkedin.send_notes:
         draft = await app.llm.write("li_connect", recipient=_recipient(person), company=_company_text(company),
                                     limit=app.settings.linkedin.note_limit)
         note = draft.body
     return app.db.add_outreach("li_connect", note, person_id=person["id"], company_id=company["id"],
                                to_addr=person["linkedin_url"], why=company["fit_reason"])
+
+
+ROLE_WORDS = re.compile(r"\b(backend|back-end|ai|ml|machine learning|llm|software|sde|full[- ]?stack|platform|engineer)\b",
+                        re.IGNORECASE)
+
+
+def pick_role(app: App, company: sqlite3.Row) -> str:
+    """The company's open role that suits you best, for the email template; a default when none is listed."""
+    for listed in meta(company).get("roles") or []:
+        title = listed.split(" (", 1)[0].strip()  # "Backend Engineer (Bengaluru, KA / Remote (IN))" -> title
+        if title and ROLE_WORDS.search(title) and not reject_reason(app.settings.filters, title, None):
+            return title
+    return app.settings.email.default_role
+
+
+def from_template(app: App, person: sqlite3.Row, company: sqlite3.Row) -> Draft:
+    fields = {"first_name": (person["name"].split() or ["there"])[0], "company": company["name"],
+              "role": pick_role(app, company)}
+    settings = app.settings.email
+    return Draft(subject=settings.template_subject.format_map(fields).strip(),
+                 body=settings.template_body.format_map(fields).strip())
+
+
+def connect_note(app: App, person: sqlite3.Row, company: sqlite3.Row) -> str:
+    fields = {"first_name": (person["name"].split() or ["there"])[0], "company": company["name"],
+              "role": pick_role(app, company)}
+    note = app.settings.outreach.connect_template.format_map(fields).strip()
+    limit = app.settings.linkedin.note_limit
+    if len(note) > limit:  # a long role title could push it over; fall back to the generic role
+        note = app.settings.outreach.connect_template.format_map({**fields, "role": "engineering"}).strip()
+    return note[:limit]
 
 
 async def draft_email(app: App, person: sqlite3.Row, company: sqlite3.Row) -> int | None:
@@ -270,7 +312,10 @@ async def draft_email(app: App, person: sqlite3.Row, company: sqlite3.Row) -> in
         app.db.set_person(person["id"], email=address, email_source=source)
         if not address:
             return None
-    draft = await app.llm.write("email", recipient=_recipient(person), company=_company_text(company))
+    if app.settings.email.template_body:
+        draft = from_template(app, person, company)
+    else:
+        draft = await app.llm.write("email", recipient=_recipient(person), company=_company_text(company))
     return app.db.add_outreach("email", _signed(app, draft.body), subject=draft.subject or f"Engineering at {company['name']}",
                                person_id=person["id"], company_id=company["id"], to_addr=address,
                                why=company["fit_reason"])
@@ -349,7 +394,8 @@ async def sync_yc(app: App) -> str:
             yc_batch=yc.short_batch(entry.get("batch")), one_liner=entry.get("one_liner"),
             description=entry.get("long_description"), location=entry.get("all_locations"),
             team_size=entry.get("team_size"),
-            meta={"stage": entry.get("stage"), "tags": entry.get("tags") or [], "summary": yc.company_summary(entry)},
+            meta={"stage": entry.get("stage"), "tags": entry.get("tags") or [], "summary": yc.company_summary(entry),
+                  "regions": entry.get("regions") or []},
         )
     scored = 0
     for company in app.db.companies("new", source="yc", limit=settings.score_per_day):
@@ -397,7 +443,10 @@ async def prepare_yc(app: App) -> str:
     """For today's best YC targets: record their jobs, find the founders, draft outreach."""
     room = app.settings.yc.companies_per_day - app.db.drafted_since("yc", app.clock.day_start())
     done = 0
-    for company in app.db.companies("target", source="yc", limit=max(room, 0), best_first=True):
+    priority = {r.lower() for r in app.settings.yc.priority_regions}
+    targets = app.db.companies("target", source="yc", limit=5000, best_first=True)
+    targets.sort(key=lambda c: not priority & {r.lower() for r in meta(c).get("regions") or []})  # stable: fit order kept
+    for company in targets[: max(room, 0)]:
         if _paused(app):
             break
         try:
@@ -646,12 +695,14 @@ async def _send_connect(app: App, page: Page, o: sqlite3.Row) -> None:
 
 async def _send_message(app: App, page: Page, o: sqlite3.Row) -> None:
     person = app.db.person(o["person_id"])
-    reach, detail = await _linkedin(app).message(page, o["to_addr"], person["name"], o["body"], app.settings.dry_run)
+    resume = app.paths.resume_pdf if app.settings.linkedin.attach_resume and app.paths.resume_pdf.exists() else None
+    reach, detail = await _linkedin(app).message(page, o["to_addr"], person["name"], o["body"], app.settings.dry_run,
+                                                 attachment=resume)
     stamp = app.clock.stamp()
     if reach is Reach.SENT:
         app.db.set_outreach(o["id"], status="sent", sent_at=stamp, error=None)
         app.db.set_person(person["id"], li_state="messaged")
-        await app.bot.mark(o["id"], "📤 Message sent.")
+        await app.bot.mark(o["id"], "📤 Message sent." + (f" ({detail})" if detail else ""))
     elif reach is Reach.DRY_RUN:
         app.db.set_outreach(o["id"], status="dry_run", sent_at=stamp)
         await app.bot.mark(o["id"], f"🧪 Dry run: {detail}.")
@@ -769,3 +820,34 @@ async def recover(app: App) -> None:
     for o in app.db.outreach_in("sending"):
         app.db.set_outreach(o["id"], status="failed", error="interrupted while sending")
         await app.bot.failed(o["id"], "interrupted while sending; check whether it went out before retrying")
+
+
+async def send_update(app: App) -> str:
+    """Every couple of hours: what happened since the last update, on Telegram."""
+    since = app.db.get("update_since") or app.clock.ago(hours=2)
+    now = app.clock.stamp()
+    db = app.db
+    found = db.scalar("SELECT COUNT(*) FROM jobs WHERE discovered_at>?", since)
+    applied = db.rows("SELECT site, title, company FROM jobs WHERE status='applied' AND applied_at>? ORDER BY applied_at", since)
+    sent = dict(db.rows("SELECT channel, COUNT(*) FROM outreach WHERE status='sent' AND sent_at>? GROUP BY channel", since))
+    replies = db.scalar("SELECT COUNT(*) FROM outreach WHERE replied_at>?", since)
+    queued = db.scalar("SELECT COUNT(*) FROM jobs WHERE status IN ('matched','queued')")
+    waiting = db.count_outreach("pending_approval") + db.count_jobs("needs_input")
+    app.db.put("update_since", now)
+    names = {"linkedin": "LinkedIn", "hirist": "Hirist", "wellfound": "Wellfound", "waas": "Work at a Startup",
+             "instahyre": "Instahyre"}
+    lines = [f"🕑 <b>Update since {parse(since).astimezone(app.clock.tz):%H:%M}</b>",
+             f"🔎 New jobs found: {found}",
+             f"✅ Applied: {len(applied)}"]
+    lines += [f"   • {esc(j['title'] or 'Job')} · {esc(j['company'] or '?')} ({names.get(j['site'], j['site'])})"
+              for j in applied[:10]]
+    if len(applied) > 10:
+        lines.append(f"   …and {len(applied) - 10} more")
+    lines.append(f"📧 Emails sent: {sent.get('email', 0)} · 🤝 LinkedIn requests: {sent.get('li_connect', 0)}"
+                 f" · 💬 LinkedIn messages: {sent.get('li_message', 0)}")
+    lines.append(f"🎉 Replies: {replies}")
+    lines.append(f"⏳ Good matches queued to apply: {queued} · Waiting on you: {waiting}")
+    spent = float(app.db.get(f"cost:{app.clock.local().date()}", "0") or 0)
+    lines.append(f"💰 Claude API cost today: ${spent:.2f}")
+    await app.bot.notify("\n".join(lines))
+    return "update sent"

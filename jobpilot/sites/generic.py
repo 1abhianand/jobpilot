@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import logging
 import re
 from dataclasses import dataclass
 
 from playwright.async_api import Locator, Page
 
-from ..browser import (close_dialogs, first_visible, goto, links, page_text, pause, scroll, text_matching,
+from ..browser import (LoggedOut, close_dialogs, first_visible, goto, links, page_text, pause, scroll, text_matching,
                        top_dialog, type_text)
 from ..forms import FormFiller
 from .base import ApplyResult, JobPage, JobStub, Outcome
+
+log = logging.getLogger(__name__)
 
 DONE = (r"^(applied|already applied|application (sent|submitted)|applied successfully)$"
         r"|^applied (on|today)\b|your application (has been|was) (sent|submitted)")
@@ -105,7 +108,13 @@ class GenericSite:
             share = -(-(limit - len(found)) // (len(urls) - index))  # a fair share of what's left
             if share <= 0:
                 break
-            await goto(page, url)
+            try:
+                await goto(page, url)
+            except LoggedOut:
+                raise
+            except Exception as exc:  # one slow search page mustn't cancel the jobs already waiting to be applied to
+                log.warning("%s: couldn't load %s (%s); skipping it this run", self.name, url, type(exc).__name__)
+                continue
             await scroll(page, rounds=6)
             taken = 0
             for link in await links(page, self.p.job_href):
@@ -121,7 +130,9 @@ class GenericSite:
 
     async def _apply_button(self, page: Page) -> Locator | None:
         name = re.compile(self.p.apply, re.IGNORECASE)
-        return await first_visible(page.get_by_role("button", name=name), page.get_by_role("link", name=name))
+        # Work at a Startup's Apply is an <a> with no href, which has no button or link role.
+        clickable = page.locator("a:not([href]), [onclick], [class*='cursor-pointer']").filter(has_text=name)
+        return await first_visible(page.get_by_role("button", name=name), page.get_by_role("link", name=name), clickable)
 
     async def read(self, page: Page, url: str) -> JobPage:
         await goto(page, url)
@@ -178,8 +189,19 @@ class GenericSite:
             if dry_run:
                 await close_dialogs(page)
                 return ApplyResult(Outcome.DRY_RUN, "filled the form; stopped before submitting")
-            await submit.click()
-            await pause(2.0, 4.0)
+            accepted: list[int] = []
+            watch = lambda response: accepted.append(response.status) if (  # noqa: E731
+                response.request.method == "POST" and "/apply" in response.url) else None
+            page.on("response", watch)
+            try:
+                await submit.click()
+                await pause(2.0, 4.0)
+            finally:
+                page.remove_listener("response", watch)
+            # Work at a Startup keeps its form open after sending; the site's accepted POST is the confirmation.
+            if any(200 <= status < 300 for status in accepted):
+                await close_dialogs(page)
+                return ApplyResult(Outcome.APPLIED)
         if await text_matching(page, self.p.done):
             await close_dialogs(page)
             return ApplyResult(Outcome.APPLIED)

@@ -150,13 +150,15 @@ class FakeLinkedIn(FakeSite):
         self.connected = False
         self.connects: list[tuple] = []
         self.messages: list[tuple] = []
+        self.attachments: list = []
 
     async def connect(self, page, url, expected, note, dry_run):
         self.connects.append((url, expected, note, dry_run))
         return (Reach.DRY_RUN, "stopped") if dry_run else (self.reach, self.detail)
 
-    async def message(self, page, url, expected, text, dry_run):
+    async def message(self, page, url, expected, text, dry_run, attachment=None):
         self.messages.append((url, expected, text, dry_run))
+        self.attachments.append(attachment)
         return (Reach.DRY_RUN, "stopped") if dry_run else (self.reach, self.detail)
 
     async def member(self, page, url):

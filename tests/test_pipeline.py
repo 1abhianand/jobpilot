@@ -171,7 +171,7 @@ async def test_scout_adds_startups_with_clean_linkedin_urls(app):
     fresh = app.db.row("SELECT * FROM companies WHERE domain='fresh.example'")
     assert (fresh["status"], fresh["linkedin_url"]) == ("target", "https://linkedin.com/company/fresh/")
     urls = [p["linkedin_url"] for p in app.db.people_of(fresh["id"])]
-    assert urls == ["https://in.linkedin.com/in/ria-sen/", None]
+    assert urls == ["https://www.linkedin.com/in/ria-sen/", None]  # country hosts become www
 
 
 async def test_scouted_company_without_people_gets_a_linkedin_lookup(app):
@@ -341,6 +341,16 @@ async def test_approved_linkedin_message_is_sent(app):
     assert app.db.person(person)["li_state"] == "messaged"
     assert app.sites["linkedin"].messages == [("https://www.linkedin.com/in/dev/", "Dev Patel",
                                                "Thanks for connecting!", False)]
+    assert app.sites["linkedin"].attachments == [None]  # off unless linkedin.attach_resume is on
+
+    app.settings.linkedin.attach_resume = True
+    app.paths.profile_dir.mkdir(parents=True, exist_ok=True)
+    app.paths.resume_pdf.write_bytes(b"%PDF-1.4 resume")
+    second = app.db.add_outreach("li_message", "Hello again", person_id=person, company_id=company,
+                                 to_addr="https://www.linkedin.com/in/dev/", status="approved")
+    await pipeline.send_browser_queue(app)
+    assert app.db.outreach(second)["status"] == "sent"
+    assert app.sites["linkedin"].attachments[-1] == app.paths.resume_pdf
 
 
 async def test_requeue_after_going_live_redoes_the_dry_run(app):
@@ -371,3 +381,69 @@ async def test_requeue_after_going_live_redoes_the_dry_run(app):
     app.settings.mode = "live"
     await pipeline.run_site(app, "instahyre")
     assert app.db.job("instahyre:1")["status"] == "applied"
+
+
+async def test_cold_emails_use_your_template(app):
+    app.mailbox = Mailbox("asha@example.org", "pw", "Asha Rao")
+    app.settings.email.template_subject = "Application for {role} at {company}"
+    app.settings.email.template_body = "Hi {first_name},\n\nI'd like to apply for the {role} role at {company}.\n\nBest,"
+    company, person = people(app)
+    app.db.set_company(company, meta={"roles": ["Head of Sales (Remote)", "Backend Engineer (Bengaluru)"]})
+    oid = await pipeline.draft_email(app, app.db.person(person), app.db.company(company))
+    o = app.db.outreach(oid)
+    assert o["subject"] == "Application for Backend Engineer at Acme AI"
+    assert o["body"].startswith("Hi Dev,\n\nI'd like to apply for the Backend Engineer role at Acme AI.")
+    assert o["body"].endswith("Asha Rao\nlinkedin.com/in/asha-example")  # signature still added
+    assert not [c for c in app.llm.calls if c[0] == "write"]  # no Claude drafting
+
+    other = app.db.upsert_company("beta.example", "Beta Labs", "yc", domain="beta.example")
+    lead = app.db.upsert_person(other, "Riya Shah", "https://www.linkedin.com/in/riya/", title="CEO")
+    oid = await pipeline.draft_email(app, app.db.person(lead), app.db.company(other))
+    assert app.db.outreach(oid)["subject"] == "Application for Software Engineer (Backend / AI) at Beta Labs"
+
+
+async def test_regular_update_reports_what_happened(app):
+    app.db.add_job("hirist", "1", "https://hirist.example/j/1", title="Backend Engineer", company="Acme",
+                   status="applied", applied_at=app.clock.ago(minutes=5))
+    await pipeline.send_update(app)
+    [(kind, text)] = app.bot.events
+    assert "New jobs found: 1" in text and "Applied: 1" in text and "Backend Engineer · Acme (Hirist)" in text
+    app.clock.moment += timedelta(hours=2)
+    await pipeline.send_update(app)
+    assert "Applied: 0" in app.bot.events[-1][1]  # only what's new since the last update
+
+
+async def test_connection_notes_and_application_notes_use_your_templates(app):
+    app.settings.outreach.connect_template = "Hi {first_name}, exploring {role} roles at {company}!"
+    app.settings.outreach.apply_note_template = "Hi {company} team, I'd love the {role} role."
+    company, person = people(app)
+    app.db.set_company(company, meta={"roles": ["AI Engineer (Remote)"]})
+    oid = await pipeline.draft_connect(app, app.db.person(person), app.db.company(company))
+    assert app.db.outreach(oid)["body"] == "Hi Dev, exploring AI Engineer roles at Acme AI!"
+    app.db.add_job("waas", "9", "https://www.workatastartup.com/jobs/9", title="Backend Engineer", company="Acme AI",
+                   meta={"company_id": company})
+    note = await pipeline.draft_application_note(app, app.db.job("waas:9"))
+    assert app.db.outreach(note)["body"] == "Hi Acme AI team, I'd love the Backend Engineer role."
+    assert not [c for c in app.llm.calls if c[0] == "write"]
+
+
+async def test_priority_regions_are_contacted_first(app):
+    app.settings.yc.priority_regions = ["United States of America"]
+    app.settings.yc.companies_per_day = 1
+    app.http = mock_http({})  # company pages 404, so prepare_yc skips drafting but keeps the order visible
+    india = app.db.upsert_company("in.example", "Bharat AI", "yc", status="target", fit=95, yc_slug="bharat",
+                                  meta={"regions": ["India"]})
+    us = app.db.upsert_company("us.example", "Frisco AI", "yc", status="target", fit=60, yc_slug="frisco",
+                               meta={"regions": ["United States of America"]})
+    seen = []
+    async def page(http, slug):
+        seen.append(slug)
+        return {"company": {"founders": []}, "jobPostings": []}
+    import jobpilot.yc as yc_module
+    original, yc_module.company_page = yc_module.company_page, page
+    try:
+        await pipeline.prepare_yc(app)
+    finally:
+        yc_module.company_page = original
+    assert seen == ["frisco"]  # the US company goes first despite a lower fit score
+    assert app.db.company(us)["status"] == "drafted" and app.db.company(india)["status"] == "target"

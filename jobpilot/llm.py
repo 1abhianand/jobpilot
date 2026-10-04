@@ -25,6 +25,18 @@ WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 1
 MAX_RESUMES = 5  # how many times a paused web-research turn is resumed before giving up
 
 T = TypeVar("T", bound=BaseModel)
+# $ per million tokens: input, output, cache read, cache write (5-minute). Web search: $10 per 1,000.
+PRICES = {"claude-opus-5": (5.0, 25.0, 0.5, 6.25), "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25),
+          "claude-sonnet-5": (2.0, 10.0, 0.2, 2.5), "claude-opus-5-5": (4.0, 20.0, 0.2, 5.0)}
+WEB_SEARCH_PRICE = 0.01
+
+
+def cost_of(model: str, usage: Any) -> float:
+    price = next((v for k, v in PRICES.items() if model.startswith(k)), PRICES["claude-opus-5"])
+    tokens = (getattr(usage, "input_tokens", 0) or 0, getattr(usage, "output_tokens", 0) or 0,
+              getattr(usage, "cache_read_input_tokens", 0) or 0, getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    searches = getattr(getattr(usage, "server_tool_use", None), "web_search_requests", 0) or 0
+    return sum(n * p for n, p in zip(tokens, price)) / 1_000_000 + searches * WEB_SEARCH_PRICE
 
 
 class LLMError(RuntimeError):
@@ -108,6 +120,7 @@ class LLM:
         self.client = client or AsyncAnthropic(max_retries=4)
         self.system = [{"type": "text", "text": prompts.system(profile, context),
                         "cache_control": {"type": "ephemeral"}}]
+        self.on_cost: Any = None  # called with (model, dollars) after every request
 
     @property
     def scoring_model(self) -> str:
@@ -131,6 +144,8 @@ class LLM:
                 output_format=schema,
                 **extra,
             )
+            if self.on_cost is not None and getattr(response, "usage", None) is not None:
+                self.on_cost(getattr(response, "model", None) or model, cost_of(model, response.usage))
             if response.stop_reason != "pause_turn":
                 break
             # A long server-side research turn paused; sending it back resumes it where it stopped.

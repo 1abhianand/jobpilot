@@ -1,0 +1,6 @@
+{
+  "buildCommand": "",
+  "outputDirectory": "public",
+  "functions": { "api/data.js": { "includeFiles": "data.json" } },
+  "headers": [{ "source": "/(.*)", "headers": [{ "key": "X-Robots-Tag", "value": "noindex" }] }]
+}
