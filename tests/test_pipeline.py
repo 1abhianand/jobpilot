@@ -89,6 +89,29 @@ async def test_note_sites_draft_notes_for_approval(app):
     assert site.applied == []
 
 
+async def test_auto_send_notes_skip_telegram_and_go_straight_to_the_queue(app):
+    app.settings.wellfound.auto_send_notes = True
+    site = app.sites["wellfound"]
+    site.stubs = [JobStub("5", "https://wellfound.com/jobs/5-backend")]
+    site.pages = {"https://wellfound.com/jobs/5-backend": page()}
+    await pipeline.run_site(app, "wellfound")
+    [note] = app.db.outreach_in("approved", ["apply_note"])
+    assert note["job_id"] == "wellfound:5" and app.db.outreach_in("draft", ["apply_note"]) == []
+
+
+async def test_a_note_greeting_another_companys_team_is_never_sent(app):
+    app.settings.mode = "live"
+    app.db.add_job("waas", "501", "https://www.workatastartup.com/jobs/501", title="Backend", company="Huvo AI",
+                   description=JD)
+    oid = app.db.add_outreach("apply_note", "Hi Finn team,\n\nI'd like to join.", job_id="waas:501", to_addr="u",
+                              status="approved")
+    await pipeline.send_browser_queue(app)
+    assert app.db.outreach(oid)["status"] == "failed" and "Finn team" in app.db.outreach(oid)["error"]
+    assert app.sites["waas"].applied == []
+    assert pipeline.same_company("Vested", "Vested Finance") and pipeline.same_company("cardboard.ai", "Cardboard")
+    assert pipeline.same_company("Huvo AI", "Huvo AI") and not pipeline.same_company("Finn", "Huvo AI")
+
+
 async def test_yc_jobs_are_scored_without_opening_a_browser(app):
     app.sites["waas"].default_searches = []
     app.db.add_job("waas", "501", "https://www.workatastartup.com/jobs/501", title="Backend Engineer",
@@ -223,7 +246,7 @@ async def test_followup_is_not_sent_after_a_reply(app, monkeypatch):
 @pytest.mark.parametrize("reach,status,li_state", [
     (Reach.SENT, "sent", "requested"),
     (Reach.PENDING, "sent", "requested"),
-    (Reach.NOTE_QUOTA, "failed", "none"),
+    (Reach.NOTE_QUOTA, "sent", "requested"),
     (Reach.WEEKLY_LIMIT, "approved", "none"),
     (Reach.CONNECTED, "skipped", "connected"),
     (Reach.NAME_MISMATCH, "failed", "none"),
@@ -237,13 +260,26 @@ async def test_connection_request_outcomes(app, reach, status, li_state):
     await pipeline.send_browser_queue(app)
     assert app.db.outreach(oid)["status"] == status
     assert app.db.person(person)["li_state"] == li_state
-    if reach is Reach.NOTE_QUOTA:
-        assert app.bot.events[-1] == ("failed", oid, "detail", True)
+    if reach is Reach.NOTE_QUOTA:  # retried at once without the note
+        assert [c[2] for c in app.sites["linkedin"].connects] == ["note", ""]
+        assert "without the note" in app.db.outreach(oid)["error"]
     if reach is Reach.WEEKLY_LIMIT:
         assert app.db.get("li_connect_blocked_until") > app.clock.stamp()
         assert not pipeline._room(app, "li_connect")
     if reach is Reach.CONNECTED:
         assert app.db.outreach_in("draft", ["li_message"])  # a message is drafted instead
+
+
+async def test_note_quota_retry_that_also_fails_is_reported(app):
+    app.settings.mode = "live"
+    company, person = people(app)
+    oid = app.db.add_outreach("li_connect", "note", person_id=person, company_id=company,
+                              to_addr="https://www.linkedin.com/in/dev/", status="approved")
+    linkedin = app.sites["linkedin"]
+    linkedin.reach, linkedin.detail, linkedin.note_quota_blocks_all = Reach.NOTE_QUOTA, "detail", True
+    await pipeline.send_browser_queue(app)
+    assert len(linkedin.connects) == 2 and app.db.outreach(oid)["status"] == "failed"
+    assert app.bot.events[-1][3] is False  # no "send without the note" button: that's what just failed
 
 
 async def test_connection_caps(app):
@@ -346,11 +382,108 @@ async def test_approved_linkedin_message_is_sent(app):
     app.settings.linkedin.attach_resume = True
     app.paths.profile_dir.mkdir(parents=True, exist_ok=True)
     app.paths.resume_pdf.write_bytes(b"%PDF-1.4 resume")
-    second = app.db.add_outreach("li_message", "Hello again", person_id=person, company_id=company,
-                                 to_addr="https://www.linkedin.com/in/dev/", status="approved")
+    other = app.db.upsert_person(company, "Mia Shah", "https://www.linkedin.com/in/mia/", title="VP Eng")
+    second = app.db.add_outreach("li_message", "Hi Mia, hello", person_id=other, company_id=company,
+                                 to_addr="https://www.linkedin.com/in/mia/", status="approved")
+    await pipeline.send_browser_queue(app)
+    assert app.db.outreach(second)["status"] == "approved"  # waits out the gap; the browser goes back to applying
+    app.clock.moment += timedelta(minutes=15)
+    await pipeline.send_browser_queue(app)
+    assert app.db.outreach(second)["status"] == "approved"  # LinkedIn rests at least 20 minutes between sends
+    app.clock.moment += timedelta(minutes=35)
     await pipeline.send_browser_queue(app)
     assert app.db.outreach(second)["status"] == "sent"
     assert app.sites["linkedin"].attachments[-1] == app.paths.resume_pdf
+
+
+async def test_linkedin_messages_you_approve_in_a_row_never_go_in_a_burst(app):
+    app.settings.mode = "live"
+    company, person = people(app)
+    first, second = (app.db.add_outreach("li_message", text, person_id=person, company_id=company,
+                                         to_addr="https://www.linkedin.com/in/dev/", status="approved")
+                     for text in ("One", "Two"))
+    await pipeline.send_now(app, first)
+    await pipeline.send_now(app, second)
+    assert app.db.outreach(first)["status"] == "sent"
+    assert app.db.outreach(second)["status"] == "approved"
+    assert "resting" in app.bot.events[-1][2]
+
+
+async def test_linkedin_rests_after_a_failure_too(app):
+    app.settings.mode = "live"
+    company, person = people(app)
+    first, second = (app.db.add_outreach("li_connect", "", person_id=person, company_id=company,
+                                         to_addr="https://www.linkedin.com/in/dev/", status="approved")
+                     for _ in range(2))
+    app.sites["linkedin"].reach, app.sites["linkedin"].detail = Reach.UNAVAILABLE, "profile didn't load"
+    assert await pipeline.send_browser_queue(app) == f"li connect #{first}: failed"
+    await pipeline.send_browser_queue(app)
+    assert app.db.outreach(second)["status"] == "approved" and len(app.sites["linkedin"].connects) == 1
+
+
+async def test_a_draft_greeting_someone_else_is_never_sent(app):
+    app.settings.mode = "live"
+    company, person = people(app)  # Dev Patel
+    oid = app.db.add_outreach("li_message", "Hi Prateek, thanks for connecting.", person_id=person,
+                              company_id=company, to_addr="https://www.linkedin.com/in/dev/", status="approved")
+    await pipeline.send_browser_queue(app)
+    assert app.db.outreach(oid)["status"] == "failed" and "'Prateek'" in app.db.outreach(oid)["error"]
+    assert app.sites["linkedin"].messages == []
+    assert pipeline.wrong_greeting("Hi Dev, thanks", "Dev Patel") is None
+    assert pipeline.wrong_greeting("Hi there, thanks", "Dev Patel") is None
+    assert pipeline.wrong_greeting("Hi Will,", "William Bodewes") is None
+    assert pipeline.wrong_greeting("Hey Maitreya!", "Arushi Gandhi") == "Maitreya"
+
+
+async def test_no_second_linkedin_message_to_one_person_within_three_days(app):
+    app.settings.mode = "live"
+    company, person = people(app)
+    first, second = (app.db.add_outreach("li_message", f"Hi Dev, {n}", person_id=person, company_id=company,
+                                         to_addr="https://www.linkedin.com/in/dev/", status="approved")
+                     for n in ("one", "two"))
+    await pipeline.send_browser_queue(app)
+    app.clock.moment += timedelta(hours=1)
+    await pipeline.send_browser_queue(app)
+    assert app.db.outreach(first)["status"] == "sent"
+    assert app.db.outreach(second)["status"] == "failed" and "last 3 days" in app.db.outreach(second)["error"]
+    assert len(app.sites["linkedin"].messages) == 1
+
+
+async def test_three_linkedin_failures_in_a_row_stop_linkedin(app):
+    app.settings.mode = "live"
+    company, person = people(app)
+    ids = [app.db.add_outreach("li_connect", "", person_id=person, company_id=company,
+                               to_addr="https://www.linkedin.com/in/dev/", status="approved") for _ in range(4)]
+    app.sites["linkedin"].reach, app.sites["linkedin"].detail = Reach.UNAVAILABLE, "profile didn't load"
+    for _ in range(4):
+        await pipeline.send_browser_queue(app)
+        app.clock.moment += timedelta(hours=1)
+    assert [app.db.outreach(i)["status"] for i in ids] == ["failed", "failed", "failed", "approved"]
+    assert app.db.get(pipeline.LINKEDIN_LOCK)
+    assert "3 LinkedIn sends failed in a row" in [e for e in app.bot.events if e[0] == "notify"][-1][1]
+
+
+async def test_a_linkedin_security_check_stops_everything_on_linkedin(app):
+    from jobpilot.browser import LoggedOut
+    from jobpilot.scheduler import Task, due, run_task
+
+    async def checkpoint(app) -> str:
+        raise LoggedOut("www.linkedin.com asked you to log in again (landed on .../checkpoint/challenge)")
+
+    await run_task(app, Task("site:linkedin", timedelta(hours=6), checkpoint))
+    await run_task(app, Task("connections", timedelta(hours=6), checkpoint))
+    notes = [e for e in app.bot.events if e[0] == "notify"]
+    assert len(notes) == 1 and "all LinkedIn activity is stopped" in notes[0][1]
+    app.clock.moment += timedelta(days=2)
+    assert not due(app, Task("site:linkedin", timedelta(hours=6), checkpoint))
+    assert not due(app, Task("connections", timedelta(hours=6), checkpoint))
+    assert due(app, Task("site:instahyre", timedelta(hours=6), checkpoint))
+    company, person = people(app)
+    oid = app.db.add_outreach("li_connect", "Hi", person_id=person, company_id=company,
+                              to_addr="https://www.linkedin.com/in/dev/", status="approved")
+    app.settings.mode = "live"
+    await pipeline.send_browser_queue(app)
+    assert app.db.outreach(oid)["status"] == "approved" and app.sites["linkedin"].connects == []
 
 
 async def test_requeue_after_going_live_redoes_the_dry_run(app):
@@ -367,7 +500,8 @@ async def test_requeue_after_going_live_redoes_the_dry_run(app):
     app.db.add_job("waas", "501", "https://www.workatastartup.com/jobs/501", title="Backend", description=JD)
     note = app.db.add_outreach("apply_note", "Dear team", job_id="waas:501", to_addr="u", status="approved")
     await pipeline.send_email_queue(app)
-    await pipeline.send_browser_queue(app)
+    for _ in range(2):  # one browser action per run
+        await pipeline.send_browser_queue(app)
     assert {app.db.outreach(o)["status"] for o in (email, connect, note)} == {"dry_run"}
     assert app.db.job("instahyre:1")["status"] == app.db.job("waas:501")["status"] == "dry_run"
 
@@ -447,3 +581,99 @@ async def test_priority_regions_are_contacted_first(app):
         yc_module.company_page = original
     assert seen == ["frisco"]  # the US company goes first despite a lower fit score
     assert app.db.company(us)["status"] == "drafted" and app.db.company(india)["status"] == "target"
+
+
+async def test_approved_items_go_out_the_moment_they_are_approved(app, monkeypatch):
+    app.settings.mode = "live"
+    app.db.add_job("waas", "601", "https://www.workatastartup.com/jobs/601", title="Backend", description=JD)
+    note = app.db.add_outreach("apply_note", "Dear team", job_id="waas:601", to_addr="u", status="approved")
+    await pipeline.send_now(app, note)
+    assert app.db.outreach(note)["status"] == "sent" and app.db.job("waas:601")["status"] == "applied"
+    await pipeline.send_browser_queue(app)  # the scheduled run doesn't apply a second time
+    assert len(app.sites["waas"].applied) == 1
+
+    app.mailbox = Mailbox("asha@example.org", "pw", "Asha Rao")
+    sent = []
+    monkeypatch.setattr(pipeline, "send", lambda box, message: sent.append(message))
+    first = app.db.add_outreach("email", "Hi", subject="Hello", to_addr="a@acme.example", status="approved")
+    second = app.db.add_outreach("email", "Hi", subject="Hello", to_addr="b@acme.example", status="approved")
+    await pipeline.send_now(app, first)
+    await pipeline.send_now(app, second)  # no waiting for the email spacing
+    assert [app.db.outreach(i)["status"] for i in (first, second)] == ["sent", "sent"] and len(sent) == 2
+
+
+async def test_held_back_items_stay_queued(app):
+    app.settings.mode = "live"
+    app.db.add_job("waas", "602", "https://www.workatastartup.com/jobs/602", title="Backend", description=JD)
+    oid = app.db.add_outreach("apply_note", "note", job_id="waas:602", to_addr="u", status="approved")
+    app.db.put("paused", "1")
+    await pipeline.send_now(app, oid)
+    assert app.db.outreach(oid)["status"] == "approved"
+    assert "/resume" in app.bot.events[-1][2]
+
+
+async def test_jobs_paying_under_the_minimum_are_skipped(app):
+    app.settings.filters.min_salary_lpa = 18
+    site = app.sites["instahyre"]
+    site.stubs = [JobStub("1", "https://instahyre.example/job-1")]
+    site.pages = {stub.url: page() for stub in site.stubs}
+    app.llm.salary = 12
+    await pipeline.run_site(app, "instahyre")
+    job = app.db.job("instahyre:1")
+    assert job["status"] == "filtered" and "18 LPA" in job["reason"] and site.applied == []
+
+    site.stubs = [JobStub("2", "https://instahyre.example/job-2")]
+    site.pages = {stub.url: page() for stub in site.stubs}
+    app.llm.salary = None  # no pay stated: not held against the job
+    await pipeline.run_site(app, "instahyre")
+    assert len(site.applied) == 1
+
+
+async def test_yc_companies_paying_under_the_minimum_get_no_outreach(app):
+    app.settings.filters.min_salary_lpa = 50  # Acme's Indian role tops out at ₹45L
+    app.mailbox = Mailbox("asha@example.org", "pw", "Asha Rao")
+    app.http = mock_http({
+        yc.HIRING_URL: (FIXTURES / "yc_hiring.json").read_text(),
+        f"{yc.YC_URL}/companies/acme-ai": (FIXTURES / "yc_company.html").read_text(),
+        f"{yc.YC_URL}/companies/acme-ai/jobs/aa1-backend-engineer": (FIXTURES / "yc_job.html").read_text(),
+    })
+    await pipeline.sync_yc(app)
+    await pipeline.prepare_yc(app)
+    acme = app.db.row("SELECT * FROM companies WHERE name='Acme AI'")
+    assert acme["status"] == "pass" and "50 LPA" in acme["fit_reason"]
+    assert app.db.job("waas:501") is None
+    assert app.db.outreach_in("draft") == []
+
+
+async def test_emails_and_messages_wait_out_sunday_then_go(app, monkeypatch):
+    from datetime import datetime, timezone
+    app.settings.mode = "live"
+    app.mailbox = Mailbox("asha@example.org", "pw", "Asha Rao")
+    sent = []
+    monkeypatch.setattr(pipeline, "send", lambda box, message: sent.append(message))
+    app.clock.moment = datetime(2026, 9, 27, 6, 0, tzinfo=timezone.utc)  # Sunday, 11:30 IST
+    email = app.db.add_outreach("email", "Hi", subject="Hello", to_addr="a@acme.example", status="approved")
+    await pipeline.send_now(app, email)
+    await pipeline.send_email_queue(app)
+    assert app.db.outreach(email)["status"] == "approved" and sent == []
+    assert "Sundays" in app.bot.events[-1][2]
+
+    app.db.add_job("waas", "701", "https://www.workatastartup.com/jobs/701", title="Backend", description=JD)
+    note = app.db.add_outreach("apply_note", "Dear team", job_id="waas:701", to_addr="u", status="approved")
+    await pipeline.send_now(app, note)
+    assert app.db.outreach(note)["status"] == "sent"  # applications don't wait
+
+    app.clock.moment += timedelta(days=1)  # Monday: the queue picks it up
+    await pipeline.send_email_queue(app)
+    assert app.db.outreach(email)["status"] == "sent" and len(sent) == 1
+
+
+async def test_approved_applications_go_out_in_a_batch(app):
+    app.settings.mode = "live"
+    for i in range(10):
+        app.db.add_job("waas", str(600 + i), f"https://www.workatastartup.com/jobs/{600 + i}", title="Backend",
+                       description=JD)
+        app.db.add_outreach("apply_note", "Dear team", job_id=f"waas:{600 + i}", to_addr="u", status="approved")
+    app.settings.waas.apply_per_day = 50
+    assert await pipeline.send_browser_queue(app) == "applications: 8 sent"
+    assert len(app.db.outreach_in("approved", ["apply_note"])) == 2

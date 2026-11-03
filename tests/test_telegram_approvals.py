@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 import pytest
@@ -204,6 +205,111 @@ async def test_commands(bot: ApprovalBot, db: DB):
     assert bot.tg.sent[-1]["buttons"][0][0][1] == f"ok:{oid}"
 
 
+async def test_queued_lists_approved_not_yet_sent(bot: ApprovalBot, db: DB):
+    await bot.handle(text("/queued"))
+    assert "Nothing queued" in bot.tg.sent[-1]["text"]
+    db.add_job("wellfound", "7", "https://wellfound.example/7", title="SDE-1", company="Zenskar")
+    note = seed(db, channel="apply_note", job_id="wellfound:7")
+    request = seed(db, channel="li_connect")
+    done = seed(db)
+    for oid in (note, request, done):
+        db.set_outreach(oid, status="approved", approved_at=bot.clock.stamp())
+    db.set_outreach(done, status="sent", sent_at=bot.clock.stamp())
+    await bot.handle(text("/queued"))
+    report = bot.tg.sent[-1]["text"]
+    assert "2 approved" in report
+    assert f"#{note} " in report and "SDE-1</a> · Zenskar" in report and f"#{request} " in report
+    assert f"#{done} " not in report
+
+
+async def test_questions_failed_run_and_answers_commands(bot: ApprovalBot, db: DB):
+    await bot.handle(text("/questions"))
+    assert bot.tg.sent[-1]["text"] == "No open form questions."
+    db.add_job("linkedin", "9", "https://www.linkedin.com/jobs/view/9/", title="Backend", company="Acme")
+    db.set_job("linkedin:9", status="needs_input", question="Current Salary (LPA)")
+    await bot.handle(text("/questions"))
+    assert "Current Salary (LPA)" in bot.tg.sent[-1]["text"]
+    await bot.handle(text("12", reply_to=bot.tg.sent[-1]["id"]))
+    assert db.learned_answer("Current Salary (LPA)") == "12"
+
+    oid = seed(db, channel="li_connect", body="note")
+    await bot.pump()
+    db.set_outreach(oid, status="failed", error="note_quota: free plan")
+    await bot.handle(text("/failed"))
+    assert bot.tg.sent[-1]["buttons"][0][0] == ("🤝 Send without the note", f"nn:{oid}")
+
+    db.put("last:site:linkedin", bot.clock.stamp())
+    await bot.handle(text("/run"))
+    assert "site:linkedin" in bot.tg.sent[-1]["text"]
+    await bot.handle(text("/run site:linkedin"))
+    assert db.get("last:site:linkedin") is None and "runs within a minute" in bot.tg.sent[-1]["text"]
+    await bot.handle(text("/run site:linkedin"))  # no last: record any more, still a known task
+    assert "runs within a minute" not in bot.tg.sent[-1]["text"]  # without a schedule, only past runs are known
+
+    bot.tasks = ["site:linkedin", "site:instahyre", "inbox"]
+    await bot.handle(text("/run linkedin"))
+    assert "▶️ site:linkedin runs within a minute" in bot.tg.sent[-1]["text"]
+    await bot.handle(text("/run insta"))
+    assert "▶️ site:instahyre runs" in bot.tg.sent[-1]["text"]
+    await bot.handle(text("/run monster"))
+    assert "I don't know the task" in bot.tg.sent[-1]["text"]
+
+    await bot.handle(text("/answers"))
+    assert "Current Salary (LPA) → <b>12</b>" in bot.tg.sent[-1]["text"]
+
+
+def test_menu_and_help_list_every_command():
+    """Typing / in Telegram should offer every command the bot handles, and /help should explain each."""
+    import inspect
+    from jobpilot import approvals
+    handled = set(re.findall(r'command == "/(\w+)"', inspect.getsource(approvals.ApprovalBot._command)))
+    menu = {name for name, _ in approvals.COMMANDS}
+    assert handled | {"help"} == menu
+    assert all(f"/{name}" in HELP for name in handled)
+
+
+async def test_menu_is_retried_until_telegram_takes_it(bot: ApprovalBot, db: DB):
+    calls = []
+
+    async def set_commands(commands):
+        calls.append(commands)
+        if len(calls) == 1:
+            raise httpx.ConnectError("offline")
+
+    bot.tg.set_commands = set_commands
+    await bot.register_commands()  # network down: nothing saved, so the next call tries again
+    await bot.register_commands()
+    await bot.register_commands()  # already up to date: no call
+    assert len(calls) == 2
+
+
+async def test_send_goes_out_right_away(bot: ApprovalBot, db: DB):
+    import asyncio
+    sent_now = []
+
+    async def send_now(oid):
+        sent_now.append(oid)
+
+    bot.send_now = send_now
+    oid = seed(db)
+    await bot.pump()
+    await bot.handle(tap(f"ok:{oid}"))
+    await asyncio.sleep(0)
+    assert sent_now == [oid] and "Sending now" in bot.tg.edits[-1][1]
+
+
+async def test_resume_says_what_goes_out_and_what_waits(bot: ApprovalBot, db: DB):
+    bot.outlook = lambda: [("apply_note", 1, ""), ("li_connect", 8, "Today's limit is reached: it goes out tomorrow."),
+                           ("email", 2, "No emails go out on Sundays: it's queued and goes out the next day.")]
+    db.put("paused", "1")
+    db.put("last:actions", bot.clock.stamp())
+    await bot.handle(text("/resume"))
+    report = bot.tg.sent[-1]["text"]
+    assert db.get("paused") == "0" and db.get("last:actions") is None  # the send run starts on the next tick
+    assert "📝 1 application" in report and "🤝 8 LinkedIn connection requests" in report
+    assert "Sundays" in report and "📧 2 emails" in report
+
+
 async def test_failed_sends_offer_retry_and_no_note(bot: ApprovalBot, db: DB):
     oid = seed(db, channel="li_connect", body="note")
     await bot.pump()
@@ -224,3 +330,65 @@ async def test_digest_lists_todays_applications(bot: ApprovalBot, db: DB):
     digest = bot.digest()
     assert "Applied: Instahyre 1" in digest
     assert "Backend &lt;Engineer&gt; · Acme (Instahyre)" in digest and "Old one" not in digest
+
+
+async def test_applied_lists_applications_by_site_and_period(bot: ApprovalBot, db: DB):
+    db.add_job("instahyre", "1", "https://instahyre.example/1", title="Backend <Engineer>", company="Acme")
+    db.set_job("instahyre:1", status="applied", applied_at=bot.clock.ago(days=2))
+    db.add_job("wellfound", "2", "https://wellfound.example/2", title="Platform", company="Beta")
+    db.set_job("wellfound:2", status="dry_run", applied_at=bot.clock.stamp())
+    db.add_job("linkedin", "3", "https://linkedin.example/3", title="Old one", company="Gamma")
+    db.set_job("linkedin:3", status="applied", applied_at=bot.clock.ago(days=20))
+    db.add_job("linkedin", "4", "https://linkedin.example/4", title="Not applied", company="Delta")
+
+    await bot.handle(text("/applied"))
+    report = bot.tg.sent[-1]["text"]
+    assert "2 applications" in report and "last 7 days" in report
+    assert '<a href="https://instahyre.example/1">Backend &lt;Engineer&gt;</a> · Acme' in report
+    assert "\n1. " in report and "\n2. " in report and "<b>Instahyre</b> (1)" in report
+    assert "Platform" in report and "🧪" in report
+    assert "Old one" not in report and "Not applied" not in report
+
+    await bot.handle(text("/applied li 30"))
+    report = bot.tg.sent[-1]["text"]
+    assert "1 application on LinkedIn" in report and "Old one" in report and "Acme" not in report
+
+    await bot.handle(text("/applied insta all"))
+    assert "on Instahyre" in bot.tg.sent[-1]["text"] and "all time" in bot.tg.sent[-1]["text"]
+
+    await bot.handle(text("/applied monster"))
+    assert "don't know the site" in bot.tg.sent[-1]["text"]
+
+
+async def test_applied_splits_long_lists(bot: ApprovalBot, db: DB):
+    for i in range(120):
+        db.add_job("linkedin", str(i), f"https://linkedin.example/{i}", title="Backend Engineer " * 3, company="Acme")
+        db.set_job(f"linkedin:{i}", status="applied", applied_at=bot.clock.stamp())
+    await bot.handle(text("/applied"))
+    assert len(bot.tg.sent) > 1 and all(len(m["text"]) <= 4096 for m in bot.tg.sent)
+
+
+async def test_sent_lists_outreach(bot: ApprovalBot, db: DB):
+    email = seed(db)
+    db.set_outreach(email, status="sent", sent_at=bot.clock.stamp())
+    note = seed(db, channel="li_connect", body="hi")
+    db.set_outreach(note, status="sent", sent_at=bot.clock.stamp(), to_addr="https://www.linkedin.com/in/dev/")
+    await bot.handle(text("/sent"))
+    report = bot.tg.sent[-1]["text"]
+    assert "2 sent" in report and "Email" in report and "LinkedIn connection request" in report
+    assert f"#{email} · " in report and f"#{note} · " in report
+    await bot.handle(text("/sent linkedin"))
+    assert "1 sent" in bot.tg.sent[-1]["text"] and "Email" not in bot.tg.sent[-1]["text"]
+
+
+async def test_command_menu_matches_help():
+    from jobpilot.approvals import COMMANDS
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    await Telegram("T", httpx.AsyncClient(transport=httpx.MockTransport(handler))).set_commands(COMMANDS)
+    assert [c["command"] for c in seen[0]["commands"]] == [name for name, _ in COMMANDS]
+    assert all(f"/{name}" in HELP for name, _ in COMMANDS if name != "help")

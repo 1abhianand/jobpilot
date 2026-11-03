@@ -18,7 +18,7 @@ from jobpilot.forms import SCAN_JS, AnswerBook, FormFiller
 from jobpilot.sites import generic as generic_module
 from jobpilot.sites import linkedin as linkedin_module
 from jobpilot.sites.base import Outcome
-from jobpilot.sites.generic import SPECS, GenericSite
+from jobpilot.sites.generic import DONE, SPECS, GenericSite
 from jobpilot.sites.linkedin import LinkedIn, Reach, names_match
 
 from .conftest import FakeLLM, make_settings
@@ -200,10 +200,18 @@ async def test_linkedin_searches_share_the_budget(page, filler):
 
 # -- LinkedIn connections and messages ------------------------------------------------------------
 
-def profile(name: str = "Mavi Kapoor", degree: str = "2nd", pending: bool = False, quota: bool = False) -> str:
+def profile(name: str = "Mavi Kapoor", degree: str = "2nd", pending: bool = False, quota: bool = False,
+            stale: str | None = None, stale_closable: bool = True, chat_name: str | None = None) -> str:
+    """`stale`: someone else's chat LinkedIn left open on the page. `chat_name`: who the Message button opens."""
     button = (f'<button aria-label="Pending, click to withdraw invitation sent to {name}">Pending</button>' if pending
               else f'<button id="connect" aria-label="Invite {name} to connect" onclick="openInvite()">Connect</button>')
-    return f"""<html><body><main>
+    closer = (f'<button aria-label="Close your conversation with {stale}" '
+              f'onclick="this.parentElement.style.display=\'none\'">x</button>' if stale_closable else "")
+    left_open = f"""<div id="stale"><h2>{stale}</h2><div class="msg-list"><p>Earlier chat</p></div>
+  <div class="msg-form__contenteditable" contenteditable="true" role="textbox"></div>
+  <button class="msg-form__send-button" onclick="window.staleSent = this.previousElementSibling.innerText">Send</button>
+  {closer}</div>""" if stale else ""
+    return f"""<html><body>{left_open}<main>
 <section class="top-card"><h1>{name}</h1><div>CTO at Acme · {degree}</div>{button}
   <button aria-label="Message {name}" onclick="openChat()">Message</button><button aria-label="More actions">More</button></section>
 <aside><section><h2>People also viewed</h2>
@@ -221,7 +229,7 @@ def profile(name: str = "Mavi Kapoor", degree: str = "2nd", pending: bool = Fals
   <div class="msg-form__contenteditable" contenteditable="true" role="textbox"></div>
   <form class="msg-form"><input type="file" id="attach" style="display:none"></form>
   <button class="msg-form__send-button" onclick="sendMessage()">Send</button>
-  <button aria-label="Close your conversation with {name}" onclick="this.parentElement.style.display='none'">x</button></div>
+  <button aria-label="Close your conversation with {chat_name or name}" onclick="this.parentElement.style.display='none'">x</button></div>
 <script>
 const $ = id => document.getElementById(id);
 function openInvite() {{ $('invite').style.display = 'block'; }}
@@ -230,9 +238,9 @@ function addNote() {{ if ({str(quota).lower()}) {{ $('invite').style.display = '
 function send(withNote) {{ window.sentNote = withNote ? document.querySelector('textarea').value : '';
   $('invite').style.display = 'none'; $('toast').style.display = 'block'; }}
 function openChat() {{ $('chat').style.display = 'block'; }}
-function sendMessage() {{ const box = document.querySelector('.msg-form__contenteditable');
+function sendMessage() {{ const box = $('chat').querySelector('.msg-form__contenteditable');
   const line = document.createElement('p'); line.textContent = box.innerText;
-  document.querySelector('.msg-list').appendChild(line); window.sentMessage = box.innerText; box.innerText = ''; }}
+  $('chat').querySelector('.msg-list').appendChild(line); window.sentMessage = box.innerText; box.innerText = ''; }}
 </script></body></html>"""
 
 
@@ -291,6 +299,89 @@ async def test_message_after_they_accept(page, filler):
     assert reach is Reach.NOT_CONNECTED
 
 
+@pytest.mark.parametrize("closable", [True, False])
+async def test_message_never_goes_into_someone_elses_open_chat(page, filler, closable):
+    # 2026-10-12: a chat with Arushi stayed open and took the messages meant for five other people
+    await serve(page, {PROFILE_URL: profile(degree="1st", stale="Arushi Gandhi", stale_closable=closable)})
+    reach, _ = await LinkedIn(filler).message(page, PROFILE_URL, "Mavi Kapoor", "Hi Mavi, thanks for connecting.",
+                                              dry_run=False)
+    assert reach is Reach.SENT
+    assert await page.evaluate("window.sentMessage") == "Hi Mavi, thanks for connecting."
+    assert await page.evaluate("window.staleSent") is None
+    assert await page.evaluate("document.querySelector('#stale .msg-form__contenteditable').innerText") == ""
+
+
+async def test_message_refuses_a_chat_that_opens_for_someone_else(page, filler):
+    await serve(page, {PROFILE_URL: profile(degree="1st", chat_name="Arushi Gandhi")})
+    reach, detail = await LinkedIn(filler).message(page, PROFILE_URL, "Mavi Kapoor", "Hi Mavi, thanks for connecting.",
+                                                   dry_run=False)
+    assert reach is Reach.FAILED and "Arushi Gandhi" in detail and "nothing was typed" in detail
+    assert await page.evaluate("window.sentMessage") is None
+    assert await page.evaluate("document.querySelector('#chat .msg-form__contenteditable').innerText") == ""
+
+
+def shadow_profile(chips: tuple[str, ...] = ("Mavi Kapoor",), link: str = "mavi-example") -> str:
+    """The 2026 layout: Message opens a "New message" draft inside the #interop-outlet shadow root, addressed by
+    "Remove <name>" chips; once sent, LinkedIn redraws it as the conversation with them."""
+    chip_html = "".join(f'<button aria-label="Remove {n}">x</button>' for n in chips)
+    window = f"""<aside class="msg-overlay-container"><div class="msg-convo-wrapper msg-overlay-conversation-bubble">
+  <h2>New message</h2><button aria-label="Close your draft conversation" class="close">x</button>
+  {chip_html}<a href="/in/{link}/">{chips[0]}</a><div class="msg-list"></div>
+  <form class="msg-form"><div class="msg-form__contenteditable" contenteditable="true" role="textbox"></div>
+    <input type="file"></form>
+  <button class="msg-form__send-button">Send</button></div></aside>"""
+    page = profile(degree="1st").replace("onclick=\"openChat()\"", "onclick=\"openShadowChat()\"")
+    return page.replace("</script>", f"""
+function openShadowChat() {{
+  const host = document.createElement('div'); host.id = 'interop-outlet'; document.body.appendChild(host);
+  const root = host.attachShadow({{mode: 'open'}});
+  root.innerHTML = `{window}`;
+  root.querySelector('.close').onclick = () => host.remove();
+  root.querySelector('.msg-form__send-button').onclick = () => {{
+    const text = root.querySelector('[role=textbox]').innerText;
+    window.sentMessage = text;
+    root.innerHTML = `<div class="msg-convo-wrapper"><h2>Mavi Kapoor</h2><a href="/in/{link}/">Mavi Kapoor</a>
+      <div class="msg-list"><p>${{text}}</p></div><div class="msg-form__contenteditable" contenteditable="true"
+      role="textbox"></div><button aria-label="Close your conversation with Mavi Kapoor">x</button></div>`;
+  }};
+}}
+</script>""")
+
+
+async def test_message_through_the_2026_shadow_root_new_message_window(page, filler):
+    await serve(page, {PROFILE_URL: shadow_profile()})
+    reach, detail = await LinkedIn(filler).message(page, PROFILE_URL, "Mavi Kapoor", "Hi Mavi, thanks for connecting.",
+                                                   dry_run=False)
+    assert reach is Reach.SENT and "didn't confirm" not in detail, detail
+    assert await page.evaluate("window.sentMessage") == "Hi Mavi, thanks for connecting."
+
+
+@pytest.mark.parametrize("chips, link", [(("Mavi Kapoor", "Arushi Gandhi"), "mavi-example"),  # a group draft
+                                         (("Mavi Kapoor",), "another-mavi-kapoor")])  # a namesake
+async def test_message_refuses_a_new_message_window_not_addressed_to_them_alone(page, filler, chips, link):
+    await serve(page, {PROFILE_URL: shadow_profile(chips, link)})
+    reach, detail = await LinkedIn(filler).message(page, PROFILE_URL, "Mavi Kapoor", "Hi Mavi, thanks for connecting.",
+                                                   dry_run=False)
+    assert reach is Reach.FAILED and "nothing was typed" in detail
+    assert await page.evaluate("window.sentMessage") is None
+
+
+async def test_an_unlabelled_required_date_is_named_from_the_captions_around_it(page):
+    await page.set_content("""<div role="dialog"><h2>Apply to Acme</h2><h3>Work experience</h3><p>Senior Advisor</p>
+      <div><p>From</p><div><label for="m"><div></div></label>
+        <select id="m" aria-describedby="e"><option value="">Month</option><option>January</option></select></div></div>
+      <div id="e">This field is required</div></div>""")
+    errors = await page.locator("[role=dialog]").evaluate(linkedin_module.ERRORS_JS)
+    assert errors[0]["label"] == "Work experience · From (Month)"
+
+
+async def test_a_linkedin_warning_page_stops_everything(page, filler):
+    warning = "<html><body><main><h1>Your account has been temporarily restricted</h1></main></body></html>"
+    await serve(page, {PROFILE_URL: warning})
+    with pytest.raises(LoggedOut, match="linkedin.com showed a warning"):
+        await LinkedIn(filler).connect(page, PROFILE_URL, "Mavi Kapoor", NOTE, dry_run=False)
+
+
 async def test_logged_out_is_reported(page, filler):
     await serve(page, {PROFILE_URL: (302, {"location": "https://www.linkedin.com/authwall?trk=x"}),
                        "https://www.linkedin.com/authwall": "<html><body>Sign in</body></html>"})
@@ -310,6 +401,18 @@ def test_names_match():
     assert names_match("Mavi Kapoor", "Mavi Kapoor, PhD")
     assert not names_match("Mavi Kapoor", "Rahul Verma")
     assert not names_match("Mavi Kapoor", "Mavi Shah")
+
+
+def test_title_from_tab_title():
+    """LinkedIn job pages have no h1, so the title filters depend on reading the tab title."""
+    from jobpilot.sites.linkedin import title_and_company
+    assert title_and_company("Voice AI Engineer | Revspot | LinkedIn") == ("Voice AI Engineer", "Revspot")
+    assert title_and_company("Revspot hiring Voice AI Engineer in Bengaluru, India | LinkedIn") == (
+        "Voice AI Engineer", "Revspot")
+    assert title_and_company("Backend Engineer | LinkedIn") == ("Backend Engineer", None)
+    assert title_and_company("LinkedIn") == (None, None)
+    assert title_and_company("") == (None, None)
+    assert title_and_company(None) == (None, None)
 
 
 # -- the shared flow for Instahyre, Hirist, Wellfound and Work at a Startup --------------------------
@@ -370,6 +473,87 @@ async def test_one_click_site(page, filler):
     assert (await site.apply(page, job_url, None, dry_run=False)).outcome is Outcome.APPLIED
 
 
+COVERED = f"""<html><body><main><h1>Backend Engineer</h1><div>{JD}</div>
+<div style="position:relative"><button id="apply" onclick="this.textContent = 'Applied'">Apply now</button>
+<a style="position:absolute;inset:0"></a></div></main></body></html>"""
+
+
+async def test_apply_button_under_an_overlay_is_still_clicked(page, filler):
+    job_url = "https://www.instahyre.com/job-12345-backend-engineer-at-acme/"
+    await serve(page, {job_url: COVERED})
+    result = await GenericSite(SPECS["instahyre"], filler).apply(page, job_url, None, dry_run=False)
+    assert result.outcome is Outcome.APPLIED, result
+
+
+INSTAHYRE_CARDS = """<html><body>
+<button ng-click="openApplyModal(opp)" data-i="0">View job »</button>
+<button ng-click="openApplyModal(opp)" data-i="1">View job »</button>
+<script>
+const opps = [
+  {employer: {company_name: 'Viven'}, job: {title: 'Backend Engineer', locations: 'Bangalore', keywords: ['Python'],
+   opportunity_url: '/job-395159-backend-engineer-at-viven-bangalore/'}},
+  {employer: {company_name: 'Kulfi'}, job: {title: 'Software Engineer', locations: 'Bangalore', keywords: [],
+   opportunity_url: '/job-445794-software-engineer-at-kulfi-bangalore/'}},
+];
+window.angular = {element: el => ({scope: () => ({opp: opps[el.dataset.i]})})};
+</script></body></html>"""
+
+
+async def test_instahyre_discovers_jobs_from_angular_cards(page, filler):
+    await serve(page, {"https://www.instahyre.com/candidate/opportunities/": INSTAHYRE_CARDS})
+    stubs = await GenericSite(SPECS["instahyre"], filler).discover(page, SPECS["instahyre"].default_searches, 5)
+    assert [(s.external_id, s.url, s.title) for s in stubs] == [
+        ("395159", "https://www.instahyre.com/job-395159-backend-engineer-at-viven-bangalore/", "Viven - Backend Engineer"),
+        ("445794", "https://www.instahyre.com/job-445794-software-engineer-at-kulfi-bangalore/", "Kulfi - Software Engineer"),
+    ]
+    assert "Python" in stubs[0].hint
+
+
+class FakeApi:
+    """page.request for instahyre_search: two pages of results, recording every query."""
+
+    def __init__(self):
+        self.queries: list[dict[str, list[str]]] = []
+
+    async def get(self, url):
+        from urllib.parse import parse_qs, urlsplit
+        query = parse_qs(urlsplit(url).query)
+        self.queries.append(query)
+        offset = int(query["offset"][0])
+        objects = [{"public_url": f"https://www.instahyre.com/job-{offset + i}-x/", "title": f"Job {offset + i}",
+                    "employer": {"company_name": "Acme"}, "locations": "Bangalore", "keywords": ["Python"]}
+                   for i in range(35)]
+        body = {"objects": objects, "meta": {"next": "more" if offset == 0 else None}}
+
+        class Response:
+            ok = True
+            status = 200
+
+            async def json(self):
+                return body
+        return Response()
+
+
+async def test_instahyre_search_url_runs_through_the_api(monkeypatch):
+    from types import SimpleNamespace
+    from jobpilot.sites.generic import instahyre_search
+
+    async def no_pause(*args):
+        return None
+    monkeypatch.setattr(generic_module, "pause", no_pause)
+    api = FakeApi()
+    page = SimpleNamespace(request=api)
+    url = ("https://www.instahyre.com/candidate/opportunities/?search=true&skills=Python,Generative AI"
+           "&location=Bangalore,Work From Home&years=1")
+    found = await instahyre_search(page, url, 50)
+    assert len(found) == 70 and found[0]["url"] == "https://www.instahyre.com/job-0-x/"
+    assert found[0]["text"] == "Acme - Job 0" and "Python" in found[0]["card"]
+    assert api.queries[0]["skills"] == ["Python", "Generative AI"]
+    assert api.queries[0]["jobLocations"] == ["Bangalore", "Work From Home"]
+    assert api.queries[0]["years"] == ["1"] and [q["offset"] for q in api.queries] == [["0"], ["35"]]
+    assert await instahyre_search(page, SPECS["instahyre"].default_searches[0], 50) is None
+
+
 def test_unknown_selector_overrides_are_rejected(filler):
     with pytest.raises(ValueError, match="unknown keys"):
         GenericSite(SPECS["hirist"], filler, {"apply_button": "x"})
@@ -406,3 +590,66 @@ async def test_form_scan_and_fill(page, filler):
         mode: document.querySelector('select').value, visa: document.querySelector('input[name=visa]:checked').value,
         terms: document.querySelector('input[name=terms]').checked, cv: document.querySelector('#cv').files.length})""")
     assert values == {"first": "Asha", "ctc": "30", "mode": "Remote", "visa": "no", "terms": True, "cv": 1}
+
+
+SLOW_CONFIRM = f"""<html><body><main><h1>Backend Engineer</h1><div>{JD}</div>
+<button id="apply" onclick="this.textContent = '…'; setTimeout(() => {{
+  this.textContent = 'Application sent!';
+  document.getElementById('toast').style.display = 'block'; }}, 4000)">Apply</button></main>
+<div id="toast" style="display:none">Application sent to Acme!</div></body></html>"""
+
+
+async def test_slow_confirmation_with_instahyre_wording_counts_as_applied(page, filler):
+    job_url = "https://www.instahyre.com/job-12345-backend-engineer-at-acme/"
+    await serve(page, {job_url: SLOW_CONFIRM})
+    site = GenericSite(SPECS["instahyre"], filler)
+    result = await site.apply(page, job_url, None, dry_run=False)
+    assert result.outcome is Outcome.APPLIED, result
+    assert (await site.read(page, job_url)).can_apply  # a fresh page load: not applied yet in this fixture
+    assert re.search(DONE, "Application sent!", re.I) and re.search(DONE, "Application sent to Acme!", re.I)
+    assert not re.search(DONE, "Applied AI Engineer", re.I) and not re.search(DONE, "Application process", re.I)
+
+
+async def test_linkedin_scrolls_past_jobs_it_has_already_seen(page, filler):
+    def search(url: str) -> str:
+        start = int(re.search(r"start=(\d+)", url).group(1))
+        ids = range(100 + start, 125 + start) if start < 75 else ()
+        items = "".join(f'<li data-occludable-job-id="{i}"><a href="/jobs/view/{i}/">Job {i}</a></li>' for i in ids)
+        return f"<html><body><main><ul>{items}</ul></main></body></html>"
+
+    await serve(page, {"https://www.linkedin.com/jobs/search/": search})
+    seen = {str(i) for i in range(100, 150)}  # the first two pages were read on earlier runs
+    stubs = await LinkedIn(filler).discover(page, ["https://www.linkedin.com/jobs/search/?keywords=x"], 5, known=seen)
+    assert [s.external_id for s in stubs] == ["150", "151", "152", "153", "154"]
+
+
+NO_CONFIRM = f"""<html><body><main><h1>Product Engineer</h1><div>{JD}</div>
+<button id="apply" onclick="this.textContent = '…'">Apply</button></main></body></html>"""
+
+APPLIED_ON_RELOAD = f"""<html><body><main><h1>Product Engineer</h1><div>{JD}</div>
+<span>Applied</span></main></body></html>"""
+
+
+async def test_a_reload_settles_an_application_that_never_showed_a_confirmation(page, filler, monkeypatch):
+    """Hirist often swallows the confirmation; the reloaded job page is what the site really thinks."""
+    monkeypatch.setattr(generic_module, "CONFIRM_WAIT", 1)
+    job_url = "https://www.hirist.tech/j/product-engineer-1676086"
+    loads: list[int] = []
+
+    def handler(_url: str) -> str:
+        loads.append(1)
+        return NO_CONFIRM if len(loads) <= 1 else APPLIED_ON_RELOAD  # apply()'s own read, then the reload
+
+    await serve(page, {job_url: handler})
+    result = await GenericSite(SPECS["hirist"], filler).apply(page, job_url, None, dry_run=False)
+    assert result.outcome is Outcome.APPLIED, result
+    assert len(loads) == 2  # it really did reload before deciding
+
+
+async def test_a_reload_that_still_shows_unapplied_stays_failed(page, filler, monkeypatch):
+    monkeypatch.setattr(generic_module, "CONFIRM_WAIT", 1)
+    job_url = "https://www.hirist.tech/j/product-engineer-1676087"
+    await serve(page, {job_url: NO_CONFIRM})
+    result = await GenericSite(SPECS["hirist"], filler).apply(page, job_url, None, dry_run=False)
+    assert result.outcome is Outcome.FAILED
+    assert "still doesn't show it as applied" in (result.detail or "")

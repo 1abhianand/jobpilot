@@ -11,14 +11,15 @@ import asyncio
 import logging
 import re
 import unicodedata
+from collections.abc import Container
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import Locator, Page
 
-from ..browser import close_dialogs, first_visible, goto, page_text, pause, scroll, text_matching, top_dialog, type_text
+from ..browser import LoggedOut, close_dialogs, first_visible, goto, page_text, pause, scroll, text_matching, top_dialog, type_text
 from ..forms import FormFiller
 from .base import ApplyResult, JobPage, JobStub, Outcome
 
@@ -75,6 +76,19 @@ COMPANIES_JS = r"""() => {
 
 ERRORS_JS = r"""(root) => {
   const out = [];
+  // 2026 date pickers have empty <label>s: name the field from the caption beside it ("From"), its placeholder
+  // option ("Month") and the step's heading ("Work experience"), so the question you get says what's missing
+  const nearby = field => {
+    const step = ((root.querySelector('h3') || root.querySelector('h2') || {}).innerText || '').trim().split('\n')[0];
+    for (let box = field.parentElement, i = 0; box && i < 6; box = box.parentElement, i++) {
+      const caption = [...box.querySelectorAll('p, legend, h4, span')].map(e => (e.innerText || '').trim())
+        .find(t => t && t.length < 80 && !/required|invalid|please|enter a|must be/i.test(t));
+      if (!caption) continue;
+      const hint = field.tagName === 'SELECT' && field.options.length ? ` (${field.options[0].text.trim()})` : '';
+      return [step, caption + hint].filter(Boolean).join(' · ');
+    }
+    return '';
+  };
   const errors = root.querySelectorAll('.artdeco-inline-feedback--error, [data-test-form-element-error-messages], [role=alert]');
   for (const err of errors) {
     const box = err.getBoundingClientRect();
@@ -89,10 +103,57 @@ ERRORS_JS = r"""(root) => {
     const ids = (field.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean);
     const said = ids.map(id => (document.getElementById(id) || {}).innerText || '').join(' ').trim();
     if (!/invalid|required|enter a|must be|please/i.test(said)) continue;
-    const label = field.labels && field.labels.length ? field.labels[0].innerText.trim().split('\n')[0] : '';
-    out.push({label, message: said.split('\n')[0], value: field.value || '', jp: field.getAttribute('data-jp-field')});
+    const own = field.labels && field.labels.length ? field.labels[0].innerText.trim().split('\n')[0] : '';
+    out.push({label: own || nearby(field), message: said.split('\n')[0], value: field.value || '',
+              jp: field.getAttribute('data-jp-field')});
   }
   return out;
+}"""
+
+CHATS_JS = r"""() => {
+  // Every visible chat box, with who its window is addressed to. Since 2026 LinkedIn draws its chats inside
+  // a shadow root (#interop-outlet), so open shadow roots are searched too. Chats left open come back on every
+  // page, so the box on screen is not necessarily the one with the person we came to message.
+  const roots = [document];
+  for (let i = 0; i < roots.length; i++)
+    for (const el of roots[i].querySelectorAll('*')) if (el.shadowRoot) roots.push(el.shadowRoot);
+  for (const root of roots)
+    root.querySelectorAll('[data-jp-chat], [data-jp-window]').forEach(el => {
+      el.removeAttribute('data-jp-chat'); el.removeAttribute('data-jp-window'); });
+  const visible = e => { const r = e.getBoundingClientRect(); return r.width && r.height; };
+  const boxes = [...new Set(roots.flatMap(r => [...r.querySelectorAll(
+    "div.msg-form__contenteditable[contenteditable='true'], [role='textbox'][contenteditable='true']")]))].filter(visible);
+  const generic = /^(new message|messaging|compose message)$/i;
+  const namesIn = win => {
+    // an open conversation: "Close your conversation with Arushi Gandhi"
+    const closers = [...win.querySelectorAll('button')]
+      .map(b => (b.getAttribute('aria-label') || b.innerText || '').trim())
+      .filter(t => /^close your conversation with\s/i.test(t))
+      .map(t => t.replace(/^close your conversation with\s*/i, '').trim());
+    // a new message: one "Remove Priyashaa Naayan" chip per recipient
+    const chips = [...win.querySelectorAll("button[aria-label^='Remove ' i]")]
+      .map(b => b.getAttribute('aria-label').replace(/^remove\s+/i, '').trim())
+      .filter(n => n && !/attachment|file|image|draft/i.test(n));
+    if (closers.length || chips.length) return [...closers, ...chips];
+    const heading = [...win.querySelectorAll('h2, h3')].map(h => h.innerText.trim().split('\n')[0])
+      .find(t => t && !generic.test(t));
+    return heading ? [heading] : [];
+  };
+  return boxes.map((box, i) => {
+    box.setAttribute('data-jp-chat', i);
+    let win = box.closest('.msg-convo-wrapper, .msg-overlay-conversation-bubble'), names = [];
+    if (win) names = namesIn(win);
+    else for (win = box.parentElement; win && win !== document.body; win = win.parentElement) {
+      names = namesIn(win);
+      if (names.length) break;
+    }
+    if (!win || win === document.body) return {index: i, names: [], profiles: []};
+    win.setAttribute('data-jp-window', i);
+    const profiles = [...new Set([...win.querySelectorAll("a[href*='/in/']")]
+      .map(a => ((a.getAttribute('href') || '').match(/\/in\/([^/?#]+)/) || [])[1])
+      .filter(Boolean).map(slug => decodeURIComponent(slug).toLowerCase()))];
+    return {index: i, names, profiles};
+  });
 }"""
 
 NEXT_STEP = re.compile(r"^(continue to next step|next|review your application|review)$", re.IGNORECASE)
@@ -101,6 +162,11 @@ EASY_APPLY = re.compile(r"^easy apply\b", re.IGNORECASE)
 APPLIED_BEFORE = re.compile(r"\bApplied \d+ (second|minute|hour|day|week|month)s? ago\b|\bApplication submitted\b")
 WEEKLY_LIMIT = re.compile(r"weekly invitation limit|reached the weekly limit|out of invitations", re.IGNORECASE)
 NOTE_UPSELL = re.compile(r"personali[sz]ed invitations|personali[sz]e (your )?invit|premium", re.IGNORECASE)
+# Pages LinkedIn shows instead of what was asked for when it is unhappy with the account. They don't live at a
+# login URL, so they're spotted by their wording; any of them stops all LinkedIn activity.
+WARNING_PAGE = re.compile(r"your account (has been |is )?(temporarily )?restricted|we('ve| have) restricted your account"
+                          r"|unusual activity (on|from) your account|commercial use limit"
+                          r"|monthly limit for (profile )?searches|let's do a quick security check", re.IGNORECASE)
 FIRST_DEGREE = re.compile(r"(^|\s|·)1st\b|\b1st degree connection\b")
 
 
@@ -154,6 +220,36 @@ def profile_url(url: str) -> str:
     return url.split("?")[0].rstrip("/") + "/"
 
 
+def profile_slug(url: str) -> str:
+    """'https://in.linkedin.com/in/Priyashaa-Naayan-690997175?x=1' -> 'priyashaa-naayan-690997175'"""
+    found = re.search(r"/in/([^/?#]+)", url or "")
+    return unquote(found.group(1)).lower() if found else ""
+
+
+def title_and_company(page_title: str | None) -> tuple[str | None, str | None]:
+    """The tab title, which LinkedIn keeps when it drops the h1 from the page.
+
+    'Voice AI Engineer | Revspot | LinkedIn'                -> ('Voice AI Engineer', 'Revspot')
+    'Revspot hiring Voice AI Engineer in Bengaluru | …'     -> ('Voice AI Engineer', 'Revspot')
+    """
+    parts = [p.strip() for p in (page_title or "").split("|")]
+    parts = [p for p in parts if p and p.lower() != "linkedin"]
+    if not parts:
+        return None, None
+    hiring = re.match(r"^(.+?)\s+hiring\s+(.+?)(?:\s+in\s+.+)?$", parts[0], re.IGNORECASE)
+    if hiring:
+        return hiring.group(2).strip(), hiring.group(1).strip()
+    return parts[0], (parts[1] if len(parts) > 1 else None)
+
+
+async def open_page(page: Page, url: str) -> None:
+    """goto, then stop everything if LinkedIn shows a restriction or warning page instead."""
+    await goto(page, url)
+    top = f"{await page.title()}\n{(await page.locator('body').inner_text())[:2000]}"
+    if found := WARNING_PAGE.search(top):
+        raise LoggedOut(f"www.linkedin.com showed a warning on your account: \"{found.group(0)}\" ({page.url.split('?')[0]})")
+
+
 class LinkedIn:
     name = "linkedin"
     label = "LinkedIn"
@@ -166,29 +262,41 @@ class LinkedIn:
 
     # -- jobs -------------------------------------------------------------------------
 
-    async def discover(self, page: Page, urls: list[str], limit: int) -> list[JobStub]:
+    async def discover(self, page: Page, urls: list[str], limit: int,
+                       known: Container[str] = ()) -> list[JobStub]:
+        """New job ids from your searches. Jobs already in `known` are scrolled past, not counted, so each run
+        reaches further down the results instead of re-reading the same top 25."""
         ids: list[str] = []
         for index, url in enumerate(urls):
             try:  # one hung search page once blocked everything for 5 hours; give each search 4 minutes
-                await asyncio.wait_for(self._search(page, url, ids, limit, len(urls) - index), timeout=240)
+                await asyncio.wait_for(self._search(page, url, ids, limit, len(urls) - index, known), timeout=240)
             except asyncio.TimeoutError:
                 log.warning("LinkedIn search took over 4 minutes, moving on: %s", url[:120])
+            except LoggedOut:
+                raise
+            except Exception as exc:  # one page that won't load mustn't cancel the jobs already waiting to be applied to
+                log.warning("LinkedIn search failed (%s), moving on: %s", type(exc).__name__, url[:120])
         return [JobStub(i, f"https://www.linkedin.com/jobs/view/{i}/") for i in ids[:limit]]
 
-    async def _search(self, page: Page, url: str, ids: list[str], limit: int, urls_left: int) -> None:
+    async def _search(self, page: Page, url: str, ids: list[str], limit: int, urls_left: int,
+                      known: Container[str] = ()) -> None:
         # Each search gets a fair share of what's left, so the first one can't crowd out the rest.
         share = -(-(limit - len(ids)) // urls_left)
         taken = 0
         for start_at in range(0, 250, 25):
             if taken >= share:
                 break
-            await goto(page, with_start(url, start_at))
-            for _ in range(6):
+            await open_page(page, with_start(url, start_at))
+            for _ in range(6):  # scroll the results list the way a person would, so every card loads
                 await page.evaluate(SCROLL_LIST_JS)
-                await pause(0.5, 1.0)
-            fresh = [i for i in await page.evaluate(JOB_IDS_JS) if i not in ids]
+                await pause(0.8, 1.6)
+            listed = await page.evaluate(JOB_IDS_JS)
+            if not listed:
+                break  # past the last page of results
+            fresh = [i for i in listed if i not in ids and i not in known]
             if not fresh:
-                break
+                await pause(1.0, 2.5)
+                continue  # a page of jobs already seen: look one page further
             fresh = fresh[: share - taken]
             ids.extend(fresh)
             taken += len(fresh)
@@ -197,7 +305,7 @@ class LinkedIn:
         return await first_visible(page.get_by_role("button", name=EASY_APPLY))
 
     async def read(self, page: Page, url: str) -> JobPage:
-        await goto(page, url)
+        await open_page(page, url)
         more = await first_visible(page.get_by_role("button", name=re.compile(r"^(see more|…\s*more|show more)",
                                                                                  re.IGNORECASE)))
         if more is not None:
@@ -206,6 +314,9 @@ class LinkedIn:
         title = (await heading.inner_text()).strip() if heading else None
         company_link = await first_visible(page.locator("main a[href*='/company/']"))
         company = (await company_link.inner_text()).strip() or None if company_link else None
+        if not title:  # LinkedIn dropped the h1 from job pages; the tab title still carries the role
+            title, from_tab = title_and_company(await page.title())
+            company = company or from_tab
         top = (await page.locator("main").first.inner_text())[:2500] if await page.locator("main").count() else ""
         description = await page_text(page, ["#job-details", ".jobs-description__content", ".jobs-description",
                                              "article", "main"])
@@ -326,7 +437,7 @@ class LinkedIn:
         return card if await card.count() else page.locator("main").first
 
     async def member(self, page: Page, url: str) -> Member | None:
-        await goto(page, profile_url(url))
+        await open_page(page, profile_url(url))
         heading = None
         for _ in range(3):  # the profile renders after the page itself has loaded
             heading = await first_visible(page.locator("main h1"), page.locator("main a[href*='/in/'] h2"),
@@ -381,7 +492,7 @@ class LinkedIn:
         href = await button.get_attribute("href")
         if href and "invite" in href:
             # The 2026 Connect is a link to the invite window; open it rather than click through overlays.
-            await goto(page, urljoin("https://www.linkedin.com/", href))
+            await open_page(page, urljoin("https://www.linkedin.com/", href))
         else:
             await button.click()
         await pause(1.0, 2.0)
@@ -446,41 +557,99 @@ class LinkedIn:
             return Reach.UNAVAILABLE, "no Message button on the profile"
         if dry_run:
             return Reach.DRY_RUN, "found the Message button; stopped before opening the chat"
+        # Chats left open come back on every page. On 2026-10-12 one stayed open and took five messages
+        # meant for other people, so close them all and only ever type into the chat named for this person.
+        await self._close_chats(page)
         await button.click()
         await pause(1.5, 2.5)
-        box = await first_visible(page.locator("div.msg-form__contenteditable[contenteditable='true']"),
-                                  page.locator("[role='textbox'][contenteditable='true']"))
-        if box is None:
-            return Reach.FAILED, "the chat box didn't open"
+        chat = await self._chat_with(page, expected, url)
+        if isinstance(chat, str):
+            await self._close_chats(page)
+            return Reach.FAILED, chat
+        box, window = chat
+        snippet = " ".join(text.split())[:40]
+        if snippet in " ".join((await window.inner_text()).split()):
+            await self._close_chats(page)
+            return Reach.SENT, "already in the conversation, so it wasn't sent again"
         await box.click()
         await box.fill(text)  # fill, not key presses: Enter may send mid-message
         await pause(0.8, 1.5)
         attached = ""
         if attachment is not None:
-            chooser = page.locator(".msg-form input[type='file'], form.msg-form__form input[type='file'], "
-                                   "[class*='msg-form'] input[type='file']")
+            chooser = window.locator("input[type='file']")
             if await chooser.count():
                 await chooser.first.set_input_files(str(attachment))
                 await pause(3.0, 5.0)  # the upload finishes before Send is usable again
                 attached = f"attached {attachment.name}"
             else:
                 attached = "couldn't find the attach button, so the message went without your resume"
-        send = await first_visible(page.locator("button.msg-form__send-button"),
-                                   page.get_by_role("button", name=re.compile(r"^send$", re.IGNORECASE)))
+        send = await first_visible(window.locator("button.msg-form__send-button"),
+                                   window.get_by_role("button", name=re.compile(r"^send$", re.IGNORECASE)))
         if send is None or await send.is_disabled():
+            await box.fill("")
             return Reach.FAILED, "the chat's Send button is unavailable"
         await send.click()
         await pause(1.5, 2.5)
-        snippet = " ".join(text.split())[:40]
-        sent = not (await box.inner_text()).strip() and snippet in " ".join(
-            (await page.locator("body").inner_text()).split())
-        for close in await page.locator("button[aria-label^='Close your' i]").all():
-            if await close.is_visible():
+        try:
+            sent = await self._delivered(page, box, window, snippet, expected, url)
+            await self._close_chats(page)
+        except Exception:
+            sent = False
+        # Send was clicked: an unconfirmed message must never be retried, or the person gets it twice.
+        return Reach.SENT, attached if sent else "Send was clicked but LinkedIn didn't confirm it; check the chat"
+
+    async def _delivered(self, page: Page, box: Locator, window: Locator, snippet: str, expected: str,
+                         url: str) -> bool:
+        """The message shows in their conversation. A new-message draft turns into a conversation once sent,
+        so when the window we typed into is gone, look for the conversation with them again."""
+        try:
+            if await window.count() and not (await box.inner_text()).strip() and \
+                    snippet in " ".join((await window.inner_text()).split()):
+                return True
+        except Exception:
+            pass
+        await pause(1.0, 2.0)
+        again = await self._chat_with(page, expected, url)
+        return not isinstance(again, str) and snippet in " ".join((await again[1].inner_text()).split())
+
+    @staticmethod
+    async def _close_chats(page: Page) -> None:
+        for _ in range(12):
+            # by accessible name, which covers an aria-label or the button's own (visually hidden) text
+            close = await first_visible(page.get_by_role("button", name=re.compile(r"^close your", re.IGNORECASE)))
+            if close is None:
+                return
+            try:
                 await close.click()
-        return (Reach.SENT, attached) if sent else (Reach.FAILED, "couldn't confirm the message went out")
+            except Exception:
+                return
+            await pause(0.3, 0.7)
+
+    @staticmethod
+    async def _chat_with(page: Page, expected: str, url: str) -> tuple[Locator, Locator] | str:
+        """The one open chat box addressed to `expected` alone, or why there isn't exactly one.
+
+        Its window must name only them (a group chat or someone else's chat is refused), and any profile links
+        in it must include theirs, so a namesake's chat can't pass either."""
+        chats: list[dict] = []
+        for _ in range(3):  # the chat window renders a moment after the click
+            chats = await page.evaluate(CHATS_JS)
+            if chats:
+                break
+            await pause(1.0, 2.0)
+        if not chats:
+            return "the chat box didn't open"
+        slug = profile_slug(url)
+        ours = [c for c in chats if c["names"] and all(names_match(expected, n) for n in c["names"])
+                and (not c["profiles"] or slug in c["profiles"])]
+        if len(ours) != 1:
+            seen = ", ".join(sorted({n for c in chats for n in c["names"]})) or "an unnamed chat"
+            return f"couldn't find exactly one chat with {expected} (open: {seen}); nothing was typed"
+        index = ours[0]["index"]
+        return page.locator(f"[data-jp-chat='{index}']"), page.locator(f"[data-jp-window='{index}']")
 
     async def company_url(self, page: Page, company: str) -> str | None:
-        await goto(page, f"https://www.linkedin.com/search/results/companies/?keywords={quote(company)}")
+        await open_page(page, f"https://www.linkedin.com/search/results/companies/?keywords={quote(company)}")
         wanted = " ".join(_plain(company))
         for result in await page.evaluate(COMPANIES_JS):
             if " ".join(_plain(result["name"])) == wanted:
@@ -492,7 +661,7 @@ class LinkedIn:
         base = company_url.split("?")[0].rstrip("/")
         found: dict[str, dict] = {}
         for keyword in keywords:
-            await goto(page, f"{base}/people/?keywords={quote(keyword)}")
+            await open_page(page, f"{base}/people/?keywords={quote(keyword)}")
             await scroll(page, rounds=2)
             for person in await page.evaluate(PEOPLE_JS):
                 found.setdefault(person["url"], person)

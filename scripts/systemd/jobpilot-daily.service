@@ -1,0 +1,17 @@
+# Runs scripts/daily.sh for one working day. Installed into ~/.config/systemd/user/.
+# If your clone is not at ~/projects/jobpilot, edit the two paths below.
+[Unit]
+Description=jobpilot: run the job search for today
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/jobpilot
+ExecStart=%h/projects/jobpilot/scripts/daily.sh
+# Chrome needs a display (browser.headless: false). Change :1 to your own $DISPLAY,
+# or point it at an Xvfb you start yourself.
+Environment=DISPLAY=:1
+# The run is stopped by the script itself at 20:15; this is just a backstop.
+TimeoutStartSec=12h
+StandardOutput=append:%h/projects/jobpilot/data/daily.log
+StandardError=append:%h/projects/jobpilot/data/daily.log

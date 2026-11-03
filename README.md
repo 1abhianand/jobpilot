@@ -44,11 +44,12 @@ reaches a person until you tap **Send** on Telegram.
 
 Each card on Telegram has **Send / Edit / Rewrite / Skip**. **Edit** replaces the text with your own,
 and **Rewrite** takes an instruction like "shorter" or "mention my Kafka work". These commands work at
-any time: `/status`, `/pending`, `/pause` and `/resume`. A summary arrives at the end of each working day.
+any time: `/status`, `/applied` (every application with its link; e.g. `/applied linkedin 30`), `/sent` (emails and LinkedIn requests/messages that went out), `/pending`, `/pause` and `/resume`. A summary arrives at the end of each working day.
 
 ## Requirements
 
-- macOS or Linux, Python 3.11+, and Google Chrome.
+- Linux or macOS, Python 3.11+, and Google Chrome. On Linux, Chrome opens a visible window, so you
+  need a graphical session (or an Xvfb display) while it runs.
 - An [Anthropic API key](https://console.anthropic.com/settings/keys) (Claude).
 - A Telegram bot. Message [@BotFather](https://t.me/BotFather) and send `/newbot`.
 - *Optional:* a Gmail account with an [App Password](https://myaccount.google.com/apppasswords), for cold
@@ -81,7 +82,8 @@ jobpilot init        # creates config.yaml, .env and profile/answers.yaml from t
 6. `jobpilot check`: checks the resume, Claude, Telegram, Gmail, YC data and Chrome in one go.
 7. `jobpilot doctor instahyre` (then `hirist`, `wellfound`): shows what jobpilot sees on each site.
    See [When a site changes](#when-a-site-changes).
-8. `jobpilot run`, and leave it running. On a Mac, use `caffeinate -i jobpilot run`.
+8. `jobpilot run`, and leave it running — or let the daily timer start it for you
+   ([run it every working day](#optional-run-it-every-working-day)).
 
 ### Going live
 
@@ -156,39 +158,40 @@ HUNTER_API_KEY=           # optional
 
 Before you push, `git status` should never list `.env`, `config.yaml`, `profile/` or `data/`.
 
-## Optional: run it every working day (macOS)
+## Optional: run it every working day
 
-`scripts/daily.sh` starts jobpilot, keeps the Mac awake with `caffeinate`, and stops it at 20:15.
-To start it each morning, save the following as `~/Library/LaunchAgents/com.you.jobpilot.plist`,
-replacing `/path/to/jobpilot`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.you.jobpilot</string>
-  <key>ProgramArguments</key><array><string>/path/to/jobpilot/scripts/daily.sh</string></array>
-  <key>StartCalendarInterval</key><array>
-    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>25</integer></dict>
-    <!-- repeat for Weekday 2-5 (and 6 for Saturday) -->
-  </array>
-  <key>StandardOutPath</key><string>/path/to/jobpilot/data/daily.log</string>
-  <key>StandardErrorPath</key><string>/path/to/jobpilot/data/daily.log</string>
-</dict></plist>
-```
-
-Then load it:
+`scripts/daily.sh` starts jobpilot at 09:25, holds a sleep/idle inhibitor so the machine stays awake,
+and stops it at 20:15. A systemd user timer starts it each morning:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.you.jobpilot.plist
+mkdir -p ~/.config/systemd/user
+cp scripts/systemd/jobpilot-daily.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now jobpilot-daily.timer
 ```
 
-Keep the project outside `~/Downloads`, `~/Documents` and `~/Desktop`. macOS doesn't let launchd read
-those folders.
+Both unit files assume the clone is at `~/projects/jobpilot`; edit the paths in
+`jobpilot-daily.service` if yours is elsewhere. The same file sets `DISPLAY=:1`, because Chrome runs
+with a visible window — change it to your own `$DISPLAY` (`echo $DISPLAY`), or point it at an Xvfb you
+start yourself.
 
-**Nothing runs while the Mac is asleep.** Keep it plugged in with the lid open during working hours.
-A scheduled wake (`sudo pmset repeat wakeorpoweron MTWRF 09:20:00`) helps, but it can't wake a Mac that
-has hibernated on a flat battery.
+| Command | What it does |
+|---|---|
+| `systemctl --user list-timers jobpilot-daily.timer` | when it next fires |
+| `systemctl --user start jobpilot-daily.service` | start today's run now, without waiting |
+| `systemctl --user stop jobpilot-daily.service` | end today's run early |
+| `tail -f data/daily.log` | what the launcher and jobpilot are doing |
+| `systemctl --user disable --now jobpilot-daily.timer` | stop starting it each morning |
+
+Running it by hand instead is just `.venv/bin/jobpilot run`.
+
+**Nothing runs while the machine is asleep or logged out.** The timer lives in your user session, so
+stay logged in during working hours; the inhibitor keeps the machine from suspending on its own while a
+run is in progress, but it can't wake a machine that is already suspended. `sudo loginctl enable-linger
+$USER` would let the timer fire without a login, but the visible Chrome window needs your graphical
+session, so leaving linger off is usually the right choice.
+
+On macOS, use `scripts/daily-macos.sh` with a launchd agent instead.
 
 ## Optional: web dashboard
 

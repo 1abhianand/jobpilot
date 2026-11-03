@@ -176,6 +176,29 @@ async def test_email_finder_prefers_hunter_then_guesses(monkeypatch):
     assert (await EmailFinder(http).find("", "acme.example"))[0] is None
 
 
+async def test_hunter_searches_on_the_full_name_when_there_is_no_surname(monkeypatch):
+    """split_name drops initials, so "Abhishek E" has no surname and the two-field form 400s."""
+    monkeypatch.setattr(email_finder, "has_mx", lambda domain: _true())
+    sent: list[dict[str, str]] = []
+
+    def hunter(request: httpx.Request) -> httpx.Response:
+        sent.append(dict(request.url.params))
+        return httpx.Response(200, json={"data": {"email": "abhishek@ressl.example", "score": 90}})
+
+    finder = EmailFinder(httpx.AsyncClient(transport=httpx.MockTransport(hunter)), hunter_key="k")
+    assert await finder.find("Abhishek E", "ressl.example") == ("abhishek@ressl.example", "hunter:90")
+    assert sent[0]["full_name"] == "Abhishek E"
+    assert "last_name" not in sent[0]
+
+    await finder.find("Dev Patel", "ressl.example")
+    assert sent[1]["first_name"] == "dev" and sent[1]["last_name"] == "patel"
+    assert "full_name" not in sent[1]
+
+
+async def _true() -> bool:
+    return True
+
+
 @pytest.mark.parametrize("question, kind, expected", [
     ("What is your current CTC?", "text", "30 LPA"),
     ("What is your current Salary ?", "text", "30 LPA"),
@@ -188,3 +211,24 @@ def test_every_ctc_wording_gets_your_answer(question, kind, expected):
     from jobpilot.forms import Field, fit, from_profile
     field = Field(0, kind, question, True, [], "")
     assert fit(from_profile(make_settings().profile, field), field) == expected
+
+
+def test_html_in_a_draft_is_rendered_never_sent_as_raw_tags():
+    # 2026-10-20: follow-ups went out with "<p>...<a href=...>Resume</a>" showing as text
+    body = ('<p>One more thing.</p><p>Are you hiring? <a href="https://drive.example/r">Resume</a> | '
+            '<a href="https://www.linkedin.com/in/asha/">LinkedIn</a></p><p>Asha</p>\n\nAsha Rao\nlinkedin.com/in/asha')
+    message = build_message(BOX, "dev@acme.example", "Re: Backend work", body)
+    text = message.get_body(("plain",)).get_content()
+    page = message.get_body(("html",)).get_content()
+    assert "<p>" not in text and "<a " not in text
+    assert "Resume: https://drive.example/r" in text and "One more thing.\n\nAre you hiring?" in text
+    assert '<a href="https://drive.example/r">Resume</a>' in page
+
+
+def test_a_plain_draft_gets_clickable_links_and_paragraphs():
+    body = "Hi Dev,\n\nMy resume: https://drive.example/r?x=1&y=2\n\nAsha Rao\nlinkedin.com/in/asha | github.com/asha"
+    message = build_message(BOX, "dev@acme.example", "Backend work", body)
+    assert message.get_body(("plain",)).get_content() == body + "\n"
+    page = message.get_body(("html",)).get_content()
+    assert '<a href="https://drive.example/r?x=1&amp;y=2">' in page and "<p>Hi Dev,</p>" in page
+    assert '<a href="https://linkedin.com/in/asha">linkedin.com/in/asha</a>' in page

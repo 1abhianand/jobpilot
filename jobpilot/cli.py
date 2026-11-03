@@ -19,12 +19,15 @@ from .browser import LoggedOut
 from .config import SITES, ConfigError, resolve_home
 from .db import question_key
 from .mail import check_login
-from .scheduler import build_tasks, run_forever
+from .pipeline import LINKEDIN_FAILS, LINKEDIN_LOCK
+from .scheduler import RESTART, build_tasks, run_forever
 from .sites import JobStub, login_urls
 from .telegram import Telegram
 
 TEMPLATES = {"config.example.yaml": "config.yaml", "env.example": ".env",
              "answers.example.yaml": "profile/answers.yaml"}
+
+PLACEHOLDER = re.compile(r"your|xx+|example", re.IGNORECASE)  # still-unedited text from the template
 
 NEXT_STEPS = """
 Next:
@@ -74,9 +77,16 @@ async def check(app: App) -> int:
 
     settings = app.settings
     report(True, f"config.yaml loaded (mode: {settings.mode})")
-    placeholders = [field for field in ("name", "email", "phone")
-                    if re.search(r"your|x{4}|example", getattr(settings.profile, field), re.IGNORECASE)]
-    report(not placeholders, "profile filled in", f"replace the placeholder {', '.join(placeholders)} in config.yaml")
+    # The signature and the exclude list are never read by Claude, so only this check catches them:
+    # a template signature would go out verbatim on every cold email.
+    placeholders = [field for field, value in (
+        ("profile.name", settings.profile.name), ("profile.email", settings.profile.email),
+        ("profile.phone", settings.profile.phone), ("profile.linkedin_url", settings.profile.linkedin_url),
+        ("profile.current_ctc", settings.profile.current_ctc), ("profile.expected_ctc", settings.profile.expected_ctc),
+        ("filters.company_exclude", " ".join(settings.filters.company_exclude)),
+        ("email.signature", settings.email.signature if settings.email.enabled else ""),
+    ) if PLACEHOLDER.search(value)]
+    report(not placeholders, "config filled in", f"replace the placeholder {', '.join(placeholders)} in config.yaml")
     try:
         report(True, f"resume read ({len(app.resume):,} characters)")
     except (FileNotFoundError, ValueError) as exc:
@@ -159,6 +169,10 @@ async def login(app: App, names: list[str]) -> int:
         print("Chrome is open with one tab per site. Log in on each, ticking 'remember me' where offered.")
         print("Your passwords go only to the sites; jobpilot keeps just the login cookies in data/browser-profile.")
         await asyncio.to_thread(input, "Press Enter here when you're done... ")
+    if "linkedin" in chosen and app.db.get(LINKEDIN_LOCK):
+        app.db.put(LINKEDIN_LOCK, "")
+        app.db.put(LINKEDIN_FAILS, "0")
+        print("LinkedIn is unlocked: jobpilot will use it again, slowly.")
     return 0
 
 
@@ -299,6 +313,7 @@ def main(argv: list[str] | None = None) -> int:
     answers_cmd.add_argument("--forget", metavar="QUESTION")
     commands.add_parser("dashboard", help="publish the Vercel dashboard now (it also updates every 30 minutes)")
     commands.add_parser("requeue", help="after switching to live: redo what the dry run only rehearsed")
+    commands.add_parser("restart", help="restart `jobpilot run` once the task in hand is finished")
     args = parser.parse_args(argv)
 
     home = resolve_home(args.home)
@@ -313,6 +328,10 @@ def main(argv: list[str] | None = None) -> int:
             return answers(app, args.forget)
         if args.command == "requeue":
             return requeue(app)
+        if args.command == "restart":
+            app.db.put(RESTART, "1")
+            print("jobpilot restarts as soon as the task it's on is finished.")
+            return 0
         work = {
             "check": lambda: check(app),
             "login": lambda: login(app, args.sites),

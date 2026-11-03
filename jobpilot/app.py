@@ -63,8 +63,11 @@ class App:
         async def rewrite(outreach, instruction):
             return await pipeline.rewrite(self, outreach, instruction)
 
+        async def send_now(outreach_id):
+            await pipeline.send_now(self, outreach_id)
+
         return ApprovalBot(self.db, Telegram(self.secrets.telegram_bot_token), self.secrets.telegram_chat_id,
-                           self.settings, self.clock, rewrite)
+                           self.settings, self.clock, rewrite, send_now, lambda: pipeline.queue_outlook(self))
 
     @cached_property
     def mailbox(self) -> Mailbox | None:

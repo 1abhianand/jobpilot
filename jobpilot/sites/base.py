@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Container
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
@@ -51,7 +52,8 @@ class Site(Protocol):
     needs_note: bool  # the application carries a note to the team, so it goes through approval
     default_searches: list[str]
 
-    async def discover(self, page: Page, urls: list[str], limit: int) -> list[JobStub]: ...
+    async def discover(self, page: Page, urls: list[str], limit: int,
+                       known: Container[str] = ()) -> list[JobStub]: ...
 
     async def read(self, page: Page, url: str) -> JobPage: ...
 

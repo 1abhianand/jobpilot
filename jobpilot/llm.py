@@ -8,6 +8,7 @@ profile + resume).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, TypeVar
 
 from anthropic import AsyncAnthropic
@@ -49,6 +50,7 @@ class JobScore(BaseModel):
     title: str | None
     company: str | None
     location: str | None
+    salary_max_lpa: float | None = None
 
 
 class Fit(BaseModel):
@@ -88,6 +90,11 @@ class ScoutResult(BaseModel):
 
 class Picks(BaseModel):
     numbers: list[int]
+
+
+def unescape(text: str) -> str:
+    """Undo a JSON escape the model sometimes double-encodes, so "\\u2014" never reaches a recipient."""
+    return re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
 
 
 def clip(text: str, limit: int) -> str:
@@ -183,11 +190,13 @@ class LLM:
             return self._ask(prompt, Draft, self.settings.writing_effort)
 
         result = await ask(draft, instruction)
-        result.body = result.body.strip()
+        result.body = unescape(result.body).strip()
         if limit and len(result.body) > limit:
             shorter = f"This version is {len(result.body)} characters; the hard limit is {limit}. Cut it to fit."
             result = await ask(result.body, shorter)
-            result.body = clip(result.body, limit)
+            result.body = clip(unescape(result.body).strip(), limit)
+        if result.subject:
+            result.subject = unescape(result.subject)
         if channel != "email":
             result.subject = None
         return result

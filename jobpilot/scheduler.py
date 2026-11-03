@@ -1,7 +1,8 @@
 """Runs each task on its own interval during working hours, while the Telegram bot listens.
 
 One task runs at a time, so there is never more than one Chrome window. The bot keeps answering
-your taps and commands while a long browser task is working.
+your taps and commands while a long browser task is working. When nothing is due, the sites take
+turns (the one run longest ago goes next), so the browser never sits idle during working hours.
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ TICK_SECONDS = 30
 QUICK = ("cards", "email", "update", "inbox", "expire", "dashboard")
 ALERT_EVERY = timedelta(hours=6)
 TASK_LIMIT = timedelta(minutes=60)  # no single task may hold the browser longer than this
+SITE_REST = timedelta(minutes=30)  # taking turns never runs the same site again sooner than this
+RESTART = "restart"  # kv flag: finish the task in hand, then exit so systemd starts the new code
 
 
 @dataclass
@@ -45,7 +48,7 @@ def build_tasks(app: App) -> list[Task]:
     tasks = [
         Task("cards", timedelta(minutes=1), pipeline.show_cards),
         Task("email", timedelta(minutes=1), pipeline.send_email_queue),
-        Task("actions", timedelta(minutes=20), pipeline.send_browser_queue),
+        Task("actions", timedelta(minutes=1), pipeline.send_browser_queue),
     ]
     if s.yc.enabled:
         tasks += [Task("yc-sync", timedelta(hours=24), pipeline.sync_yc),
@@ -90,7 +93,10 @@ async def run_task(app: App, task: Task) -> str:
         return ""
     except LoggedOut as exc:
         log.warning("%s: %s", task.name, exc)
-        await alert(app, f"login:{task.name}", f"🔒 {exc}")
+        if "linkedin.com" not in str(exc):
+            await alert(app, f"login:{task.name}", f"🔒 {exc}")
+        elif pipeline.lock_linkedin(app, str(exc)):
+            await app.bot.notify(pipeline.linkedin_stopped(str(exc)))
         return ""
     except Exception as exc:
         log.exception("task %s failed", task.name)
@@ -101,11 +107,36 @@ async def run_task(app: App, task: Task) -> str:
     return summary
 
 
+def linkedin_resting(app: App, task: Task) -> bool:
+    """Right after a connection request or message, LinkedIn gets a break; other sites use the time.
+    After a security check it stays untouched until you log in again."""
+    if task.name not in ("site:linkedin", "connections"):
+        return False
+    return (pipeline.linkedin_resting(app) or bool(app.db.get(pipeline.LINKEDIN_LOCK))
+            or not app.clock.send_hours())  # LinkedIn is only used in the daytime, like a person would
+
+
 def due(app: App, task: Task) -> bool:
     if task.working_hours and not app.clock.working():
         return False
+    if linkedin_resting(app, task):
+        return False
     last = app.db.get(f"last:{task.name}")
     return last is None or parse(last) + task.every <= app.clock.now()
+
+
+def next_site(app: App, tasks: list[Task]) -> Task | None:
+    """The site run longest ago that has rested a while, to fill time when nothing is due."""
+    if not app.clock.working():
+        return None
+    # LinkedIn only runs on its own schedule: extra turns would mean many more page loads than a person makes
+    rested = [t for t in tasks if t.name.startswith("site:") and t.name != "site:linkedin"
+              and (not (last := app.db.get(f"last:{t.name}")) or parse(last) + SITE_REST <= app.clock.now())]
+    return min(rested, key=lambda t: app.db.get(f"last:{t.name}") or "", default=None)
+
+
+def stopping(app: App) -> bool:
+    return app.db.get("paused") == "1" or app.db.get(RESTART) == "1"
 
 
 async def maybe_digest(app: App) -> None:
@@ -132,29 +163,49 @@ async def tick(app: App, tasks: list[Task]) -> None:
         log.exception("digest failed")
 
 
-async def _loop(app: App, tasks: list[Task], digest: bool) -> None:
+async def work_pass(app: App, tasks: list[Task]) -> bool:
+    """Run every due browser task; if none was due, give the next site its turn. True if anything ran."""
+    ran = busy = False
+    for task in tasks:
+        if stopping(app):
+            return ran
+        if due(app, task):
+            busy = bool(await run_task(app, task)) or busy  # "" = nothing to do yet, e.g. a send gap
+            ran = True
+    if not busy and not stopping(app) and (task := next_site(app, tasks)):
+        await run_task(app, task)
+        ran = True
+    return ran
+
+
+async def _quick_loop(app: App, tasks: list[Task]) -> None:
     while True:
-        if digest:
-            await tick(app, tasks)
-        else:
-            for task in tasks:
-                if app.db.get("paused") == "1":
-                    break
-                if due(app, task):
-                    await run_task(app, task)
+        await tick(app, tasks)
         await asyncio.sleep(TICK_SECONDS)
+
+
+async def _work_loop(app: App, tasks: list[Task]) -> None:
+    while app.db.get(RESTART) != "1":  # checked only between tasks, so a restart never cuts one off
+        if not await work_pass(app, tasks):
+            await asyncio.sleep(TICK_SECONDS)
+    log.info("restarting between tasks, as asked")
 
 
 async def run_forever(app: App) -> None:
     tasks = build_tasks(app)
     quick = [t for t in tasks if t.name in QUICK]
     slow = [t for t in tasks if t.name not in QUICK]
+    app.bot.tasks = [t.name for t in tasks]
+    app.db.put(RESTART, "")
     await pipeline.recover(app)
     mode = "dry run: nothing is really sent" if app.settings.dry_run else "LIVE"
-    await app.bot.notify(f"🚀 jobpilot started ({mode}). /status for today's numbers, /pause to stop everything.")
-    helpers = [asyncio.create_task(app.bot.poll_forever()), asyncio.create_task(_loop(app, quick, digest=True))]
+    app.db.put("menu_commands", "")  # re-send the / menu on every start, in case it was changed in Telegram
+    await app.bot.register_commands()
+    await app.bot.notify(f"🚀 jobpilot started ({mode}). /status for today's numbers, /applied and /sent for "
+                         "what went out, /pause to stop everything. Type / for every command.")
+    helpers = [asyncio.create_task(app.bot.poll_forever()), asyncio.create_task(_quick_loop(app, quick))]
     try:
-        await _loop(app, slow, digest=False)
+        await _work_loop(app, slow)
     finally:
         for helper in helpers:
             helper.cancel()

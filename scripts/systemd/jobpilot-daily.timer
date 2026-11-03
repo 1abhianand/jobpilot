@@ -1,0 +1,12 @@
+# Starts jobpilot at 09:25, every day, in the machine's local timezone.
+[Unit]
+Description=jobpilot: start the job search every morning
+
+[Timer]
+OnCalendar=*-*-* 09:25
+# Don't start a missed run hours later: the script would only have part of the day left anyway.
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

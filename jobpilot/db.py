@@ -242,8 +242,10 @@ class DB:
         self.update("companies", company_id, **fields)
 
     def companies(self, status: str, source: str | None = None, limit: int = 50,
-                  best_first: bool = False) -> list[sqlite3.Row]:
+                  best_first: bool = False, newest_batch_first: bool = False) -> list[sqlite3.Row]:
         order = "fit DESC, id" if best_first else "id"
+        if newest_batch_first:  # YC's own order is oldest batch first, which spends the daily budget on 2019
+            order = "CAST(SUBSTR(yc_batch, 2, 2) AS INTEGER) DESC, id"
         if source:
             return self.rows(f"SELECT * FROM companies WHERE status=? AND source=? ORDER BY {order} LIMIT ?",
                              status, source, limit)
@@ -386,6 +388,29 @@ class DB:
             f"SELECT site, title, company, status FROM jobs WHERE status IN ({_marks(APPLIED_LIKE)}) "
             "AND applied_at>=? ORDER BY site, applied_at", *APPLIED_LIKE, since)
 
+    def applications(self, since: str, site: str | None = None) -> list[sqlite3.Row]:
+        """Every application made since `since`, newest first, optionally for one site."""
+        sql = (f"SELECT * FROM jobs WHERE status IN ({_marks(APPLIED_LIKE)}) AND applied_at>=?"
+               + (" AND site=?" if site else "") + " ORDER BY applied_at DESC")
+        return self.rows(sql, *APPLIED_LIKE, since, *((site,) if site else ()))
+
+    def sent_list(self, since: str, channels: Iterable[str]) -> list[sqlite3.Row]:
+        """Outreach that went out since `since`, newest first, with who it went to."""
+        channels = tuple(channels)
+        return self.rows(
+            "SELECT o.*, p.name AS person_name, p.title AS person_title, c.name AS company_name "
+            "FROM outreach o LEFT JOIN people p ON o.person_id=p.id LEFT JOIN companies c ON o.company_id=c.id "
+            f"WHERE o.status IN ({_marks(SENT_LIKE)}) AND o.channel IN ({_marks(channels)}) AND o.sent_at>=? "
+            "ORDER BY o.sent_at DESC", *SENT_LIKE, *channels, since)
+
+    def queued_list(self) -> list[sqlite3.Row]:
+        """Approved outreach that hasn't gone out yet, oldest approval first, with who and which job."""
+        return self.rows(
+            "SELECT o.*, p.name AS person_name, c.name AS company_name, "
+            "j.title AS job_title, j.company AS job_company, j.url AS job_url "
+            "FROM outreach o LEFT JOIN people p ON o.person_id=p.id LEFT JOIN companies c ON o.company_id=c.id "
+            "LEFT JOIN jobs j ON o.job_id=j.id "
+            "WHERE o.status IN ('approved', 'sending') ORDER BY COALESCE(o.approved_at, o.created_at), o.id")
 
     def applied_by_site(self, since: str) -> dict[str, int]:
         found = self.rows(

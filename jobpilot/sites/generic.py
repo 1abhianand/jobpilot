@@ -8,13 +8,17 @@ used both in Python and in the page's JavaScript, so keep them to syntax both un
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import logging
 import re
+from collections.abc import Awaitable, Callable, Container
 from dataclasses import dataclass
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from playwright.async_api import Locator, Page
+from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from ..browser import (LoggedOut, close_dialogs, first_visible, goto, links, page_text, pause, scroll, text_matching,
                        top_dialog, type_text)
@@ -23,8 +27,10 @@ from .base import ApplyResult, JobPage, JobStub, Outcome
 
 log = logging.getLogger(__name__)
 
-DONE = (r"^(applied|already applied|application (sent|submitted)|applied successfully)$"
-        r"|^applied (on|today)\b|your application (has been|was) (sent|submitted)")
+DONE = (r"^(applied|already applied|application (sent|submitted)|applied successfully)\s*[.!]?$"
+        r"|^applied (on|today)\b|your application (has been|was) (sent|submitted)"
+        r"|^application (sent|submitted) (to|successfully)\b")  # Instahyre: "Application sent to Acme!"
+CONFIRM_WAIT = 15  # seconds a slow site (Hirist's spinning Apply button) gets to show its confirmation
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,67 @@ class Spec:
     needs_note: bool  # the application includes a note to the team (approved on Telegram first)
     opens_form: bool  # the first Apply click opens a form instead of applying on the spot
     patterns: Patterns
+    listing_js: str | None = None  # for search pages whose job cards aren't links: returns [{url, text, card}]
+    # for search pages that don't run their search from the URL: (page, url, limit) -> [{url, text, card}] or None
+    search: Callable[[Page, str, int], Awaitable[list[dict[str, str]] | None]] | None = None
+    form_url: str | None = None  # a page the Apply click can lead to that is itself the application form
+
+
+# Instahyre's opportunity cards are AngularJS buttons ("View job »") with no href; the job's own page
+# URL sits on each card's scope.
+INSTAHYRE_LISTING_JS = """() => {
+  if (!window.angular) return [];
+  const out = [];
+  for (const el of document.querySelectorAll('[ng-click="openApplyModal(opp)"]')) {
+    const opp = angular.element(el).scope()?.opp;
+    const job = opp?.job;
+    if (!job?.opportunity_url) continue;
+    const company = opp.employer?.company_name || job.hiring_company_name || '';
+    out.push({url: new URL(job.opportunity_url, location.origin).href,
+              text: `${company} - ${job.title}`,
+              card: [`${company} - ${job.title}`, job.locations, (job.keywords || []).join(', '),
+                     opp.employer?.instahyre_note || ''].join('\\n').slice(0, 800)});
+  }
+  return out;
+}"""
+
+INSTAHYRE_API = "https://www.instahyre.com/api/v1/job_search"
+INSTAHYRE_PAGE = 35  # the API's page size
+
+
+async def instahyre_search(page: Page, url: str, limit: int) -> list[dict[str, str]] | None:
+    """Instahyre's search page ignores its own URL on load, so run the search through the API it calls.
+
+    Takes the URL the search page shows after a search, e.g.
+    /candidate/opportunities/?search=true&skills=Python,LLM&location=Bangalore,Work From Home&years=1
+    (skills are OR-ed). Returns None for a URL that isn't a search, such as the recommendations page.
+    """
+    query = parse_qs(urlsplit(url).query)
+    if query.get("search") != ["true"]:
+        return None
+    split = lambda key: [v.strip() for value in query.get(key, []) for v in value.split(",") if v.strip()]  # noqa: E731
+    params = [("company_size", "0"), ("job_type", "0"), ("status", "0")]
+    params += [("skills", s) for s in split("skills")] + [("jobLocations", c) for c in split("location")]
+    params += [("years", y) for y in query.get("years", [])[:1]]
+    out: list[dict[str, str]] = []
+    offset = 0
+    while len(out) < limit:
+        response = await page.request.get(f"{INSTAHYRE_API}?{urlencode(params + [('offset', str(offset))])}")
+        if not response.ok:
+            log.warning("instahyre: search API returned HTTP %s for %s", response.status, url)
+            break
+        data = await response.json()
+        for item in data.get("objects", []):
+            company = (item.get("employer") or {}).get("company_name", "")
+            text = f"{company} - {item.get('title', '')}"
+            out.append({"url": item.get("public_url", ""), "text": text,
+                        "card": "\n".join([text, item.get("locations", ""), ", ".join(item.get("keywords") or []),
+                                           (item.get("employer") or {}).get("instahyre_note") or ""])[:800]})
+        offset += INSTAHYRE_PAGE
+        if not (data.get("meta") or {}).get("next"):
+            break
+        await pause()
+    return out
 
 
 SPECS = {
@@ -56,13 +123,17 @@ SPECS = {
         needs_note=False, opens_form=False,
         patterns=Patterns(job_href=r"instahyre\.com/job[-/]\d+", job_id=r"/job[-/](\d+)",
                           apply=r"^\s*(apply|apply now|i'?m interested|interested)\s*$"),
+        listing_js=INSTAHYRE_LISTING_JS, search=instahyre_search,
     ),
     "hirist": Spec(
         name="hirist", label="Hirist", login_url="https://www.hirist.tech/",
         default_searches=("https://www.hirist.tech/",),  # your logged-in job feed
         needs_note=False, opens_form=False,
         patterns=Patterns(job_href=r"hirist\.tech/j/", job_id=r"-(\d{4,})(?:\.html)?(?:[/?]|$)",
-                          apply=r"^\s*(apply|apply now|easy apply|quick apply)\s*$"),
+                          apply=r"^\s*(apply|apply now|easy apply|quick apply)\s*$",
+                          submit=r"^\s*(next|submit|submit application)\s*$"),
+        # Jobs with screening questions send the Apply click to their own page; Hirist pre-fills most answers.
+        form_url=r"/job/\d+/screening",
     ),
     "wellfound": Spec(
         name="wellfound", label="Wellfound", login_url="https://wellfound.com/login",
@@ -102,7 +173,8 @@ class GenericSite:
         found = re.search(self.p.job_id, url)
         return found.group(1) if found else hashlib.sha1(url.encode()).hexdigest()[:16]
 
-    async def discover(self, page: Page, urls: list[str], limit: int) -> list[JobStub]:
+    async def discover(self, page: Page, urls: list[str], limit: int,
+                       known: Container[str] = ()) -> list[JobStub]:
         found: dict[str, JobStub] = {}
         for index, url in enumerate(urls):
             share = -(-(limit - len(found)) // (len(urls) - index))  # a fair share of what's left
@@ -115,12 +187,18 @@ class GenericSite:
             except Exception as exc:  # one slow search page mustn't cancel the jobs already waiting to be applied to
                 log.warning("%s: couldn't load %s (%s); skipping it this run", self.name, url, type(exc).__name__)
                 continue
-            await scroll(page, rounds=6)
+            searched = await self.spec.search(page, url, share) if self.spec.search else None
+            if searched is None:
+                await scroll(page, rounds=6)
             taken = 0
-            for link in await links(page, self.p.job_href):
+            listed = searched if searched is not None else await links(page, self.p.job_href)
+            if searched is None and self.spec.listing_js:
+                listed += [item for item in await page.evaluate(self.spec.listing_js)
+                           if re.search(self.p.job_href, item["url"], re.IGNORECASE)]
+            for link in listed:
                 job_url = link["url"].split("?")[0]
                 job_id = self.job_id(job_url)
-                if job_id in found:
+                if job_id in found or job_id in known:
                     continue
                 found[job_id] = JobStub(job_id, job_url, title=link["text"] or None, hint=link["card"])
                 taken += 1
@@ -148,6 +226,8 @@ class GenericSite:
         dialog = await top_dialog(page)
         if dialog is not None:
             return dialog
+        if self.spec.form_url and re.search(self.spec.form_url, page.url):
+            return page.locator("body")
         if self.needs_note and await first_visible(page.locator(self.p.note_box)) is not None:
             return page.locator("body")  # some sites put the application form inline
         return None
@@ -162,7 +242,17 @@ class GenericSite:
             return ApplyResult(Outcome.UNAVAILABLE, "no Apply button on the job page")
         if dry_run and not self.spec.opens_form:
             return ApplyResult(Outcome.DRY_RUN, f"stopped before clicking {(await button.inner_text()).strip()!r}")
-        await button.click()
+        try:
+            await button.click(timeout=8_000)
+        except PlaywrightTimeout:
+            # Instahyre lays an empty link over its Apply button, so the pointer can't reach it; the
+            # button's own click handler still works.
+            await button.evaluate("el => el.click()")
+        if self.spec.form_url:
+            try:
+                await page.wait_for_url(re.compile(self.spec.form_url), timeout=10_000)
+            except PlaywrightTimeout:
+                pass  # applied on the spot, or the confirmation is on its way
         await pause(1.5, 3.0)
         noted = False
         for attempt in range(4):
@@ -202,7 +292,21 @@ class GenericSite:
             if any(200 <= status < 300 for status in accepted):
                 await close_dialogs(page)
                 return ApplyResult(Outcome.APPLIED)
-        if await text_matching(page, self.p.done):
+        if await self._confirmed(page):
             await close_dialogs(page)
             return ApplyResult(Outcome.APPLIED)
-        return ApplyResult(Outcome.FAILED, "clicked Apply but saw no confirmation")
+        # Hirist often never renders the confirmation even though the application did go through.
+        # Reloading the job page asks the site itself, which is the reliable answer.
+        await close_dialogs(page)
+        await goto(page, url)
+        if await text_matching(page, self.p.done):
+            return ApplyResult(Outcome.APPLIED)
+        return ApplyResult(Outcome.FAILED, "clicked Apply, and the reloaded job page still doesn't show it as applied")
+
+    async def _confirmed(self, page: Page) -> bool:
+        """Wait a little for the site to say the application went through; some take a few seconds."""
+        for _ in range(CONFIRM_WAIT * 2):
+            if await text_matching(page, self.p.done):
+                return True
+            await asyncio.sleep(0.5)
+        return False

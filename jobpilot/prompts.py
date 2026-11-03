@@ -8,21 +8,28 @@ from .config import Profile
 
 BRIEFS = {
     "li_connect": (
-        "a LinkedIn connection note. Hard limit: {limit} characters including spaces. One or two sentences: "
-        "something specific about their company or work, who {first} is in a few words, and a light ask. "
-        "No greeting line, no sign-off."
+        "a LinkedIn connection note. Hard limit: {limit} characters including spaces. Start with \"Hi\", their first name and a comma. "
+        "Then one simple, honest line on why {first} is reaching out (something about their "
+        "company that genuinely interests them), one plain line about what {first} does, and a short, friendly "
+        "close in your own words It should read like a quick note a person typed on their phone: "
+        "everyday words, no clever analysis of their business, no tech jargon or list of tools. "
+        "No sign-off, no line breaks."
     ),
     "email": (
-        "a cold email. Body 80-140 words. Open with why their company in particular, then the one or two "
-        "achievements from the resume most relevant to what they build, then an easy ask: a 15-minute chat "
-        "about engineering roles, or a pointer to the right person. Plain text, short paragraphs. "
-        'End the body with just "{first}"; links and a signature are added separately. '
-        "subject: 3-8 words, specific to them, no clickbait."
+        "a cold email. Body 70-120 words. Start with \"Hi\", their first name and a comma, on its own line. "
+        "Then, like a person writing to someone they'd like to meet: one or two sentences on why their company "
+        "caught {first}'s interest, in plain words; a short, simple line on what {first} works on now and "
+        "one concrete result from the resume that's relevant to them (one number at most, no list of tools); "
+        "and an easy, low-pressure ask: a quick chat about engineering roles, or a pointer to the right "
+        "person. Two or three short paragraphs. "
+        'End the body with "Thanks," on one line and "{first}" on the next; links and a signature are added '
+        "separately. subject: 3-7 plain words, specific to them, like a person would write it."
     ),
     "li_message": (
-        "a LinkedIn message to someone who just accepted {first}'s connection request. 250-500 characters. "
-        "A brief thanks, one line on what {first} does that ties to their company, then ask about engineering "
-        "openings or a short chat. No sign-off."
+        "a LinkedIn message to someone who just accepted {first}'s connection request. 200-450 characters. "
+        "Start with \"Hi\", their first name and a comma. Thank them for connecting, say in one plain line what "
+        "{first} works on and why that made them want to reach out, then ask casually whether their team is "
+        "hiring engineers or if they'd be up for a short chat. No sign-off."
     ),
     "followup": (
         "a follow-up to the earlier email below, which got no reply. Body 30-70 words. Add one new, relevant "
@@ -31,8 +38,8 @@ BRIEFS = {
     ),
     "apply_note": (
         "the note that goes with {first}'s application to this job. 70-130 words. Why this role at this "
-        "company, the two most relevant proofs from the resume, and when they can start (notice period: "
-        "{notice} days). Address the team rather than a named person unless a name is given."
+        "company, the two most relevant proofs from the resume, and say plainly that {first} is {start}. "
+        "Address the team rather than a named person unless a name is given."
     ),
 }
 
@@ -42,7 +49,10 @@ def _first(profile: Profile) -> str:
 
 
 def _roles(profile: Profile) -> str:
-    return ", ".join(profile.target_roles) or "software engineering roles"
+    roles = ", ".join(profile.target_roles) or "software engineering roles"
+    if profile.role_titles:
+        roles += f"; the titles {', '.join(profile.role_titles)} all count as this same role"
+    return roles
 
 
 def _places(profile: Profile) -> str:
@@ -56,11 +66,14 @@ def system(profile: Profile, context: str) -> str:
 Everything you know about {first} is in the profile and resume below. Treat them as the only source of truth: never invent or inflate employers, titles, numbers, skills, projects or links. When something isn't there, say less rather than guess.
 
 When you write as {first}:
-- Write like a sharp engineer writing to a peer: plain words, concrete details, short sentences.
-- Open with what is specific to the recipient or their company, then the one or two things from the resume that matter most to them.
-- No flattery, no filler openers ("I hope this finds you well", "I came across your profile"), no buzzwords ("passionate", "synergy", "rockstar"), no emojis, no exclamation marks.
-- Don't bring up salary.
+- Sound like a friendly, genuine person, not a pitch deck: the way {first} would actually write to someone they'd like to meet. Use everyday words, contractions (I'm, I've, you're) and short, natural sentences.
+- Talk about the recipient's company the way a curious person would, mentioning the one specific thing that interests {first}, not with a sharp analysis of their business. Vary how you open: don't fall back on a stock line like "I've been reading about" or "I came across".
+- Keep {first}'s own background simple and modest: what they work on in plain terms, one concrete result at most. Say "I work on" or "I've been building", never "I own" or "end to end". No stacks of tools, techniques or numbers.
+- Don't copy phrases from the profile or resume word for word; say it the way you'd say it out loud.
+- No flattery, no filler openers ("I hope this finds you well", "I came across your profile"), no buzzwords ("passionate", "synergy", "rockstar", "leverage"), no emojis, no em dashes (use a comma or a full stop). At most one exclamation mark.
+- Don't bring up salary, pay, CTC or compensation expectations.
 - Never say or imply that the message was written with AI or sent by a tool.
+- Write plain text only: no HTML tags, no Markdown. Put any link as the bare URL (https://...), never as <a href> or [text](url).
 
 {context}"""
 
@@ -77,10 +90,12 @@ Weigh, in this order:
 1. Role and seniority: is it one of the roles they want ({_roles(profile)}) at a level that suits {years} of experience?
 2. Stack and domain: how much of what the job needs shows up in their resume?
 3. Location: can they take it from where they are? They prefer {_places(profile)}. A role that needs a foreign work permit or on-site presence abroad is a poor fit unless the posting says it sponsors visas or hires remotely from their country.
+4. Company: a well-known product company (FAANG and other top tech firms) or a funded, growing startup beats a staffing agency, a recruiter posting for an unnamed client, or an IT-services/outsourcing firm. Use the profile's pitch for what {first} wants.
 
 Scale: 85-100 apply today, 70-84 good fit, 50-69 stretch, below 50 poor fit.
 reason: one short line naming the strongest match or the deal-breaker.
 title, company, location: as the posting states them, or null when it doesn't say.
+salary_max_lpa: the top of the pay range the posting states for this role, as Indian rupees in lakhs per year (₹18L, 18 LPA and ₹18,00,000 a year are all 18; convert monthly pay to yearly and other currencies at today's rate). Fixed pay only, not equity. null when the posting states no pay.
 
 <job source="{site}" url="{url}">
 {header}
@@ -109,7 +124,7 @@ def write(profile: Profile, channel: str, *, recipient: str | None = None, compa
           job: str | None = None, previous: str | None = None, draft: str | None = None,
           instruction: str | None = None, limit: int | None = None) -> str:
     first = _first(profile)
-    brief = BRIEFS[channel].format(first=first, limit=limit or 200, notice=profile.notice_period_days)
+    brief = BRIEFS[channel].format(first=first, limit=limit or 200, start=profile.start_text())
     parts = [f"Write {brief}"]
     if channel != "email":
         parts.append("subject: null.")

@@ -57,6 +57,10 @@ class Telegram:
             if "message is not modified" not in str(exc) and "message to edit not found" not in str(exc):
                 raise
 
+    async def set_commands(self, commands: list[tuple[str, str]]) -> None:
+        """The command menu Telegram shows when you type / (names without the slash)."""
+        await self.call("setMyCommands", commands=[{"command": name, "description": text} for name, text in commands])
+
     async def answer_callback(self, callback_id: str, text: str | None = None) -> None:
         try:
             await self.call("answerCallbackQuery", callback_query_id=callback_id, text=text)

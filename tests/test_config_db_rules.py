@@ -17,7 +17,7 @@ def test_template_config_is_valid():
     assert settings.dry_run
     assert settings.site("linkedin").search_urls[0].startswith("https://www.linkedin.com/jobs/search/")
     assert settings.waas.apply_per_day == 8
-    assert "Ola" in settings.filters.company_exclude
+    assert settings.filters.company_exclude  # a starting point for your own employer
 
 
 def test_template_answers_compile():
@@ -58,6 +58,15 @@ def test_upsert_company_keeps_status_and_merges_meta(db: DB):
     assert company["status"] == "target"
     assert company["name"] == "Acme Inc"
     assert yaml.safe_load(company["meta"]) == {"roles": ["Backend"], "stage": "Early"}
+
+
+def test_companies_newest_batch_first(db: DB):
+    """YC lists oldest batch first, which would spend the whole daily scoring budget on 2019."""
+    for key, batch in [("a.example", "W19"), ("b.example", "X26"), ("c.example", "W23"), ("d.example", "S20")]:
+        db.upsert_company(key, key, "yc", status="new", yc_batch=batch)
+    assert [c["yc_batch"] for c in db.companies("new", source="yc", newest_batch_first=True)] == \
+        ["X26", "W23", "S20", "W19"]
+    assert [c["yc_batch"] for c in db.companies("new", source="yc")] == ["W19", "X26", "W23", "S20"]
 
 
 def test_people_dedupe_on_linkedin_url(db: DB):
@@ -124,3 +133,39 @@ def test_yc_job_locations():
     assert not location_ok("Remote (US)", patterns)
     assert not location_ok("Berlin, Germany", patterns)
     assert not location_ok(None, patterns)
+
+
+def test_salary_ranges_are_read_in_lakhs_a_year():
+    from jobpilot.rules import below_salary_floor, salary_max_lpa
+    assert salary_max_lpa("₹10L - ₹25L") == 25
+    assert salary_max_lpa("12-18 LPA") == 18
+    assert salary_max_lpa("₹8,00,000 - ₹12,00,000") == 12
+    assert salary_max_lpa("₹40,000 - 60,000 per month") == 7.2
+    assert salary_max_lpa("$150K - $200K") == 176
+    assert salary_max_lpa("Competitive") is None and salary_max_lpa(None) is None
+    assert below_salary_floor(17, 18) and not below_salary_floor(None, 18) and not below_salary_floor(12, 0)
+
+
+def test_messages_only_go_out_in_sending_hours_on_working_days():
+    from datetime import datetime, timezone
+
+    from jobpilot.clock import Clock
+    settings = make_settings(schedule={"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                                       "start": "00:00", "end": "23:59"})
+    at = lambda *t: Clock(settings.schedule, now=lambda: datetime(*t, tzinfo=timezone.utc))  # noqa: E731
+    thursday_noon, thursday_3am, sunday_noon = at(2026, 9, 24, 6, 30), at(2026, 9, 23, 21, 30), at(2026, 9, 27, 6, 30)
+    assert not thursday_noon.holding("email") and not thursday_noon.holding("li_message")
+    assert thursday_3am.holding("email") and thursday_3am.holding("li_message")
+    assert sunday_noon.holding("email")
+    for clock in (thursday_3am, sunday_noon):  # applications never wait; LinkedIn requests wait like messages
+        assert not clock.holding("apply_note") and clock.holding("li_connect") and clock.working()
+
+
+def test_available_from_counts_the_notice_period_down():
+    from datetime import date
+    profile = make_settings(profile={"available_from": "2026-11-07", "notice_period_days": 30}).profile
+    assert profile.notice_days(date(2026, 10, 23)) == 15
+    assert profile.start_text(date(2026, 10, 23)) == "available to join within 15 days, by 7 November"
+    assert profile.notice_days(date(2026, 11, 9)) == 0
+    assert profile.start_text(date(2026, 11, 9)) == "available to join immediately"
+    assert make_settings(profile={"notice_period_days": 30}).profile.notice_days() == 30

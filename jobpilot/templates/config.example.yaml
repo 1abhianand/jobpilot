@@ -15,6 +15,8 @@ profile:
   years_experience: 0
   notice_period_days: 60
   current_ctc: "XX LPA"            # only used to fill application forms, never put in messages
+  current_fixed: ""                # optional: forms that ask for fixed pay alone get these
+  expected_fixed: ""
   expected_ctc: "XX LPA"
   target_roles: [Backend Engineer, Software Engineer, AI Engineer]
   preferred_locations: [Bengaluru, Remote (India)]
@@ -25,7 +27,9 @@ profile:
 filters:
   title_include: []                # regexes; empty lets the scorer decide
   title_exclude: ['\bintern(ship)?\b', '\b(principal|director|vp|head of)\b', '\b(sales|marketing|recruit\w*)\b']
-  company_exclude: [Ola, Olacabs, ANI Technologies, Ola Electric, Krutrim]   # your current employer at least
+  # Your current employer at least, with every name it trades under. Matched as whole words.
+  company_exclude: [Your Current Employer]
+  min_salary_lpa: 0                # skip jobs and YC leads whose stated pay tops out below this (₹ lakh a year); 0 = off
 
 llm:
   model: claude-opus-5
@@ -36,9 +40,13 @@ llm:
 
 schedule:
   timezone: Asia/Kolkata
-  days: [mon, tue, wed, thu, fri, sat]
+  days: [mon, tue, wed, thu, fri, sat, sun]
   start: "09:30"
   end: "20:00"                     # the daily summary arrives at this time
+  hold_days: [sun]                 # on these days the channels below wait in the queue, then go out the next day
+  hold_channels: [email, li_message]
+  send_start: "09:30"              # ...and they only go out between these hours; everything else runs round the clock
+  send_end: "19:00"
 
 browser:
   channel: chrome                  # your installed Google Chrome
@@ -55,7 +63,7 @@ email:
   followup_after_days: 5
   max_followups: 1
   attach_resume: false             # cold emails with attachments land in spam more often
-  signature: |
+  signature: |                     # goes out verbatim on every cold email: edit before going live
     Your Name
     linkedin.com/in/your-handle | +91 XXXXXXXXXX
 

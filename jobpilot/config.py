@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
@@ -29,12 +30,32 @@ class Profile(BaseModel):
     website: str = ""
     years_experience: float = 0
     notice_period_days: int = 0
+    # The date you can start (YYYY-MM-DD). When set, the notice period counts down to it, so notes and forms
+    # say "within 9 days" next week and "immediately" once it has passed.
+    available_from: date | None = None
     current_ctc: str = ""
     expected_ctc: str = ""
+    current_fixed: str = ""  # for forms that ask for the fixed part on its own
+    expected_fixed: str = ""
     target_roles: list[str] = Field(default_factory=list)
+    # Job titles that all mean the role you want: searched on every site that takes a title, scored as one role
+    role_titles: list[str] = Field(default_factory=list)
     preferred_locations: list[str] = Field(default_factory=list)
     work_authorization: str = ""
     pitch: str = ""
+
+    def notice_days(self, today: date | None = None) -> int:
+        if self.available_from is None:
+            return self.notice_period_days
+        return max(0, (self.available_from - (today or date.today())).days)
+
+    def start_text(self, today: date | None = None) -> str:
+        """How notes say when you can join."""
+        days = self.notice_days(today)
+        if days == 0:
+            return "available to join immediately"
+        by = f", by {self.available_from:%-d %B}" if self.available_from else ""
+        return f"available to join within {days} days{by}"
 
     @property
     def first_name(self) -> str:
@@ -46,6 +67,7 @@ class Filters(BaseModel):
     title_include: list[str] = Field(default_factory=list)  # regexes; a title must match one (empty = any)
     title_exclude: list[str] = Field(default_factory=list)  # regexes; a match rejects the job
     company_exclude: list[str] = Field(default_factory=list)  # names, matched as whole words
+    min_salary_lpa: float = 0  # skip jobs and YC leads whose stated pay tops out below this (₹ lakh a year); 0 = off
 
 
 class LLMSettings(BaseModel):
@@ -58,9 +80,15 @@ class LLMSettings(BaseModel):
 
 class Schedule(BaseModel):
     timezone: str = "Asia/Kolkata"
-    days: list[str] = Field(default_factory=lambda: ["mon", "tue", "wed", "thu", "fri", "sat"])
+    days: list[str] = Field(default_factory=lambda: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
     start: str = "09:30"
     end: str = "20:00"
+    # Days when these channels don't send: approved ones wait in the queue and go out on the next other day.
+    hold_days: list[str] = Field(default_factory=lambda: ["sun"])
+    hold_channels: list[str] = Field(default_factory=lambda: ["email", "li_message", "li_connect"])
+    # Those channels also only send inside these hours (people read messages in the daytime).
+    send_start: str = "09:30"
+    send_end: str = "19:00"
 
 
 class BrowserSettings(BaseModel):
@@ -81,6 +109,7 @@ class SiteSettings(BaseModel):
     reads_per_run: int = 25  # job pages opened and scored per run
     apply_per_day: int = 15
     min_score: int = 72
+    auto_send_notes: bool = False  # sites with application notes: send them without asking you on Telegram first
     selectors: dict[str, str] = Field(default_factory=dict)  # overrides for the site's default patterns
 
 

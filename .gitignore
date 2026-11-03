@@ -25,3 +25,6 @@ dashboard/.vercel/
 *.db-*
 *.log
 .DS_Store
+
+# Claude Code session files
+.claude/

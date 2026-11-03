@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable
@@ -16,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from .clock import Clock
+from .clock import Clock, parse
 from .config import Settings
 from .db import DB
 from .llm import Draft
@@ -33,13 +34,37 @@ SEND_LABELS = {"apply_note": "✅ Apply", "li_connect": "✅ Send request"}
 SITE_NAMES = {"linkedin": "LinkedIn", "instahyre": "Instahyre", "hirist": "Hirist", "wellfound": "Wellfound",
               "waas": "Work at a Startup"}
 MAX_CARD = 3900  # Telegram's limit is 4096; leave room for the status line
+SITE_ALIASES = {"li": "linkedin", "insta": "instahyre", "wf": "wellfound", "yc": "waas"}
+SENT_FILTERS = {"email": ("email",), "linkedin": ("li_connect", "li_message"), "li": ("li_connect", "li_message")}
+DEFAULT_DAYS = 7
+COMMANDS = [  # the / menu in Telegram; keep in step with HELP and _command
+    ("status", "Today's numbers"),
+    ("applied", "Applications with links. e.g. /applied linkedin 30"),
+    ("sent", "Emails and LinkedIn requests sent. e.g. /sent linkedin"),
+    ("pending", "Show open approval cards again"),
+    ("queued", "What you approved that hasn't gone out yet"),
+    ("questions", "Ask the open application-form questions again"),
+    ("failed", "Sends that failed, with Retry buttons"),
+    ("run", "Run a task now. e.g. /run linkedin"),
+    ("answers", "Form answers I've saved for you"),
+    ("pause", "Stop all automation"),
+    ("resume", "Restart automation"),
+    ("help", "What I do and how to use me"),
+]
 
 HELP = """I send you every email, LinkedIn note and application note before it goes out.
 
 On each card: <b>Send</b> approves it, <b>Edit</b> lets you reply with your own text, <b>Rewrite</b> asks for an instruction ("shorter", "mention my Kafka work") and redrafts, <b>Skip</b> drops it.
 
 /status: today's numbers
+/applied: applications from the last 7 days, with links. Add a site and/or days: <code>/applied linkedin</code>, <code>/applied insta 30</code>, <code>/applied wellfound all</code>
+/sent: emails and LinkedIn requests/messages that went out, same options: <code>/sent linkedin 14</code>
 /pending: show open cards again
+/queued: what you approved that hasn't gone out yet
+/questions: ask the open application-form questions again
+/failed: sends that failed, with Retry buttons
+/run: run a task now instead of waiting, e.g. <code>/run linkedin</code> or <code>/run insta</code>; on its own it lists the tasks
+/answers: form answers I've saved for you
 /pause and /resume: stop and restart all automation"""
 
 
@@ -86,13 +111,31 @@ def summary(db: DB, clock: Clock, settings: Settings) -> str:
 
 class ApprovalBot:
     def __init__(self, db: DB, tg: Telegram, chat_id: int, settings: Settings, clock: Clock,
-                 rewrite: Rewriter):
+                 rewrite: Rewriter, send_now: Callable[[int], Awaitable[None]] | None = None,
+                 outlook: Callable[[], list[tuple[str, int, str]]] | None = None):
         self.db = db
         self.tg = tg
         self.chat_id = chat_id
         self.settings = settings
         self.clock = clock
         self.rewrite = rewrite
+        self.tasks: list[str] = []  # scheduled task names, filled in by the scheduler for /run
+        self.send_now = send_now
+        self.outlook = outlook
+        self._sending: set[asyncio.Task[None]] = set()
+
+    def _send_right_away(self, outreach_id: int) -> None:
+        """Hand an approved item to the sender in the background, so the bot keeps answering meanwhile."""
+        if self.send_now is None:
+            return
+        task = asyncio.create_task(self.send_now(outreach_id))
+        self._sending.add(task)
+        task.add_done_callback(self._sent)
+
+    def _sent(self, task: asyncio.Task[None]) -> None:
+        self._sending.discard(task)
+        if not task.cancelled() and task.exception():
+            log.error("sending right away failed", exc_info=task.exception())
 
     # -- cards ------------------------------------------------------------------
 
@@ -168,6 +211,19 @@ class ApprovalBot:
 
     async def notify(self, text: str) -> None:
         await self.tg.send(self.chat_id, text)
+
+    async def register_commands(self) -> None:
+        """Make the / menu match COMMANDS. Cheap to call often: it only talks to Telegram when the list changed
+        or the last attempt failed (e.g. the network was down at startup)."""
+        wanted = json.dumps(COMMANDS)
+        if self.db.get("menu_commands") == wanted:
+            return
+        try:
+            await self.tg.set_commands(COMMANDS)
+        except (httpx.HTTPError, TelegramError) as exc:  # only the menu is lost; typed commands still work
+            log.warning("couldn't register the Telegram command menu: %s", exc)
+            return
+        self.db.put("menu_commands", wanted)
 
     async def ask_answer(self, job: sqlite3.Row, question: str, options: list[str], hint: str = "") -> None:
         site = SITE_NAMES.get(job["site"], job["site"])
@@ -252,7 +308,11 @@ class ApprovalBot:
         if action == "ok":
             self.db.set_outreach(oid, status="approved", approved_at=stamp, error=None)
             await self.tg.answer_callback(query["id"], "Approved")
-            await self.mark(oid, "✅ Approved. It goes out with the next send run, in working hours.")
+            if self.send_now is None:
+                await self.mark(oid, "✅ Approved. It goes out with the next send run, in working hours.")
+            else:
+                await self.mark(oid, "✅ Approved. Sending now…")
+                self._send_right_away(oid)
         elif action == "no":
             self.db.set_outreach(oid, status="rejected")
             if o["channel"] == "apply_note" and o["job_id"]:
@@ -265,7 +325,8 @@ class ApprovalBot:
                 fields["body"] = ""
             self.db.set_outreach(oid, **fields)
             await self.tg.answer_callback(query["id"], "Queued again")
-            await self.mark(oid, "🔁 Queued again.")
+            await self.mark(oid, "🔁 Sending again now…" if self.send_now else "🔁 Queued again.")
+            self._send_right_away(oid)
         else:
             await self.tg.answer_callback(query["id"])
             if action == "ed":
@@ -282,7 +343,7 @@ class ApprovalBot:
     async def _on_text(self, message: dict[str, Any]) -> None:
         text = message["text"].strip()
         if text.startswith("/"):
-            await self._command(text.split()[0].split("@")[0].lower())
+            await self._command(text)
             return
         reply_to = (message.get("reply_to_message") or {}).get("message_id")
         prompt = self.db.take_prompt(reply_to) if reply_to else None
@@ -336,15 +397,228 @@ class ApprovalBot:
                                f"{self.render(o)}\n\n✏️ Replaced by the new version below.")
         await self._show(self.db.outreach(o["id"]))
 
-    async def _command(self, command: str) -> None:
+    # -- history -------------------------------------------------------------------
+
+    async def notify_long(self, lines: list[str]) -> None:
+        """Send a list that may be longer than one Telegram message, split on line boundaries."""
+        chunk: list[str] = []
+        for line in lines:
+            if chunk and sum(len(x) + 1 for x in chunk) + len(line) > MAX_CARD:
+                await self.notify("\n".join(chunk))
+                chunk = []
+            chunk.append(line)
+        if chunk:
+            await self.notify("\n".join(chunk))
+
+    def _period(self, args: list[str]) -> tuple[str, str, list[str]]:
+        """Pull a day count ("30") or "all" out of command arguments: (since stamp, label, other args)."""
+        days: int | None = DEFAULT_DAYS
+        rest = []
+        for arg in args:
+            if arg.isdigit() and int(arg) > 0:
+                days = int(arg)
+            elif arg in ("all", "ever"):
+                days = None
+            else:
+                rest.append(arg)
+        if days is None:
+            return "", "all time", rest
+        if days == 1:
+            return self.clock.day_start(), "today", rest
+        return self.clock.ago(days=days), f"last {days} days", rest
+
+    def _day(self, stamp: str | None) -> str:
+        return parse(stamp).astimezone(self.clock.tz).strftime("%d %b %H:%M") if stamp else "?"
+
+    @staticmethod
+    def _site(arg: str) -> str | None:
+        arg = SITE_ALIASES.get(arg, arg)
+        for key, name in SITE_NAMES.items():
+            if key.startswith(arg) or name.lower().replace(" ", "").startswith(arg):
+                return key
+        return None
+
+    def applied_report(self, args: list[str]) -> list[str]:
+        since, period, rest = self._period(args)
+        site = None
+        if rest:
+            site = self._site(rest[0])
+            if site is None:
+                return [f"I don't know the site “{esc(rest[0])}”. Try one of: "
+                        + ", ".join(SITE_NAMES) + "."]
+        jobs = self.db.applications(since, site)
+        where = f" on {SITE_NAMES[site]}" if site else ""
+        if not jobs:
+            return [f"No applications{where} ({period})."]
+        counts: dict[str, int] = {}
+        for job in jobs:
+            counts[job["site"]] = counts.get(job["site"], 0) + 1
+        lines = [f"📝 <b>{len(jobs)} application{'s' if len(jobs) != 1 else ''}{where}</b> ({period})"]
+        if not site:
+            lines.append(", ".join(f"{SITE_NAMES.get(s, s)} {n}" for s, n in sorted(counts.items())))
+        number = 0
+        for key in sorted(counts):
+            if not site:
+                lines += ["", f"<b>{esc(SITE_NAMES.get(key, key))}</b> ({counts[key]})"]
+            for job in (j for j in jobs if j["site"] == key):
+                number += 1
+                title = f'<a href="{attr(job["url"])}">{esc(job["title"] or "Job")}</a>'
+                extra = " · ".join(esc(x) for x in (job["company"], job["location"]) if x)
+                dry = " 🧪" if job["status"] == "dry_run" else ""
+                lines.append(f"{number}. {self._day(job['applied_at'])}: {title}" + (f" · {extra}" if extra else "") + dry)
+        if any(j["status"] == "dry_run" for j in jobs):
+            lines += ["", "🧪 = dry run, not really submitted."]
+        return lines
+
+    def sent_report(self, args: list[str]) -> list[str]:
+        since, period, rest = self._period(args)
+        channels = ("email", "li_connect", "li_message")
+        if rest:
+            if rest[0] not in SENT_FILTERS:
+                return [f"I don't know “{esc(rest[0])}”. Try <code>/sent email</code> or <code>/sent linkedin</code>."]
+            channels = SENT_FILTERS[rest[0]]
+        sent = self.db.sent_list(since, channels)
+        if not sent:
+            return [f"Nothing sent ({period})."]
+        lines = [f"📤 <b>{len(sent)} sent</b> ({period})"]
+        for o in sent:
+            who = esc(o["person_name"] or o["to_addr"] or "?")
+            if o["company_name"]:
+                who += f" · {esc(o['company_name'])}"
+            if o["channel"] in ("li_connect", "li_message") and o["to_addr"]:
+                who = f'<a href="{attr(o["to_addr"])}">{who}</a>'
+            label = LABELS[o["channel"]] + (" (follow-up)" if o["parent_id"] else "")
+            state = " ↩️ replied" if o["replied_at"] else (" 🧪" if o["status"] == "dry_run" else "")
+            lines.append(f"{ICONS[o['channel']]} #{o['id']} · {self._day(o['sent_at'])}: {who} ({label}){state}")
+        return lines
+
+    def queued_report(self) -> list[str]:
+        queued = self.db.queued_list()
+        if not queued:
+            return ["Nothing queued. Everything you approved has gone out."]
+        lines = [f"⏳ <b>{len(queued)} approved, waiting to go out</b>"]
+        for o in queued:
+            if o["channel"] == "apply_note":
+                who = esc(o["job_title"] or "Job")
+                if o["job_url"]:
+                    who = f'<a href="{attr(o["job_url"])}">{who}</a>'
+                if o["job_company"] and o["job_company"] not in (o["job_title"] or ""):
+                    who += f" · {esc(o['job_company'])}"
+            else:
+                who = esc(o["person_name"] or o["to_addr"] or "?")
+                if o["company_name"]:
+                    who += f" · {esc(o['company_name'])}"
+                if o["channel"] in ("li_connect", "li_message") and o["to_addr"]:
+                    who = f'<a href="{attr(o["to_addr"])}">{who}</a>'
+            state = " (sending now)" if o["status"] == "sending" else ""
+            lines.append(f"{ICONS[o['channel']]} #{o['id']} {who} ({LABELS[o['channel']]}){state}")
+        return lines
+
+    async def ask_open_questions(self) -> None:
+        jobs = self.db.rows("SELECT * FROM jobs WHERE status='needs_input' ORDER BY updated_at")
+        if not jobs:
+            await self.notify("No open form questions.")
+        for job in jobs:
+            await self.ask_answer(job, job["question"] or "?", [])
+
+    async def show_failed(self) -> None:
+        failed = self.db.outreach_in("failed")
+        if not failed:
+            await self.notify("Nothing failed.")
+        for o in failed:
+            reason = o["error"] or "unknown error"
+            await self.failed(o["id"], reason, without_note=o["channel"] == "li_connect" and bool(o["body"])
+                              and reason.startswith("note_quota"))
+
+    def task_names(self) -> list[str]:
+        """The scheduled tasks (set when the scheduler starts), else every task that has run before."""
+        if self.tasks:
+            return sorted(self.tasks)
+        return sorted(row["key"][len("last:"):] for row in self.db.rows("SELECT key FROM kv WHERE key LIKE 'last:%'"))
+
+    def resolve_task(self, arg: str) -> str | None:
+        """A task name from what you typed: exact ("site:linkedin"), or a site's short name ("linkedin", "insta")."""
+        names = self.task_names()
+        if arg in names:
+            return arg
+        site = self._site(arg.removeprefix("site:"))
+        if site and f"site:{site}" in names:
+            return f"site:{site}"
+        matches = [n for n in names if n.startswith(arg)]
+        return matches[0] if len(matches) == 1 else None
+
+    async def run_now(self, args: list[str]) -> None:
+        names = self.task_names()
+        task = self.resolve_task(args[0]) if args else None
+        if task is None:
+            unknown = f"I don't know the task “{esc(args[0])}”. " if args else ""
+            await self.notify(f"{unknown}Tasks: " + ", ".join(f"<code>{esc(n)}</code>" for n in names)
+                              + "\nFor example <code>/run linkedin</code> or <code>/run site:instahyre</code>.")
+            return
+        self.db.conn.execute("DELETE FROM kv WHERE key=?", (f"last:{task}",))
+        paused = " You're paused, so it waits for /resume." if self.db.get("paused") == "1" else ""
+        await self.notify(f"▶️ {esc(task)} runs within a minute, once anything already running finishes.{paused}")
+
+    def answers_report(self) -> list[str]:
+        saved = self.db.rows("SELECT question, answer FROM answers ORDER BY created_at")
+        if not saved:
+            return ["No saved form answers yet."]
+        return [f"💾 <b>{len(saved)} saved answers</b>"] + [f"• {esc(a['question'])} → <b>{esc(a['answer'])}</b>"
+                                                            for a in saved]
+
+    def resume_report(self) -> str:
+        """Unpause, start the held-back sends on the next tick, and say what happens now."""
+        self.db.conn.execute("DELETE FROM kv WHERE key IN ('last:actions', 'email_next_at', 'actions_next_at')")
+        lines = ["▶️ <b>Resumed.</b> Job search and applying pick up again within a minute."]
+
+        def phrase(channel: str, n: int) -> str:
+            label = LABELS[channel] if LABELS[channel].startswith("LinkedIn") else LABELS[channel].lower()
+            return f"{ICONS[channel]} {n} {label}{'s' if n != 1 else ''}"
+
+        outlook = self.outlook() if self.outlook else []
+        going = [phrase(c, n) for c, n, why in outlook if not why]
+        if going:
+            lines += ["", "<b>Going out now</b> (one at a time, a little apart):", *going]
+        waiting: dict[str, list[str]] = {}
+        for c, n, why in outlook:
+            if why:
+                waiting.setdefault(why, []).append(phrase(c, n))
+        for why, items in waiting.items():
+            lines += ["", f"<b>Still waiting</b>: {esc(why)}", *items]
+        open_cards = self.db.count_outreach("pending_approval")
+        questions = self.db.count_jobs("needs_input")
+        if open_cards or questions:
+            lines += ["", f"Waiting on you: {open_cards} cards (/pending), {questions} form questions (/questions)."]
+        if not outlook:
+            lines += ["", "Nothing approved is queued. /queued shows the queue any time."]
+        return "\n".join(lines)
+
+    async def _command(self, text: str) -> None:
+        command, *args = text.split()
+        command = command.split("@")[0].lower()
+        args = [a.lower() for a in args]
         if command == "/status":
             await self.notify(self.summary())
+        elif command == "/applied":
+            await self.notify_long(self.applied_report(args))
+        elif command == "/sent":
+            await self.notify_long(self.sent_report(args))
         elif command == "/pause":
             self.db.put("paused", "1")
             await self.notify("⏸ Paused. Nothing will be applied to or sent until /resume.")
         elif command == "/resume":
             self.db.put("paused", "0")
-            await self.notify("▶️ Resumed.")
+            await self.notify(self.resume_report())
+        elif command == "/questions":
+            await self.ask_open_questions()
+        elif command == "/failed":
+            await self.show_failed()
+        elif command == "/run":
+            await self.run_now(args)
+        elif command == "/answers":
+            await self.notify_long(self.answers_report())
+        elif command == "/queued":
+            await self.notify_long(self.queued_report())
         elif command == "/pending":
             open_cards = self.db.outreach_in("pending_approval")
             if not open_cards:

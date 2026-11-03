@@ -28,19 +28,29 @@ from .clock import iso, parse
 from .db import meta
 from .email_finder import domain_of
 from .llm import Draft, LLMError
-from .mail import build_message, scan_inbox, send
-from .rules import company_excluded, location_ok, reject_reason
+from .mail import as_text, build_message, scan_inbox, send
+from .roles import role_searches
+from .rules import below_salary_floor, company_excluded, location_ok, reject_reason, salary_max_lpa
 from .sites.base import ApplyResult, Outcome, Site
-from .sites.linkedin import LinkedIn, Reach, profile_url
+from .sites.linkedin import LinkedIn, Reach, names_match, profile_url
 
 if TYPE_CHECKING:
     from .app import App
 
 log = logging.getLogger(__name__)
+# The connection dropped or a page never loaded: the job is fine, so it stays queued for the next run.
+NETWORK = re.compile(r"net::ERR_|Page\.goto: Timeout|name resolution|Request timed out|Connection error", re.I)
 
 BROWSER_CHANNELS = ("li_connect", "li_message", "apply_note")
 ACTION_GAPS = {"li_connect": (90, 240), "li_message": (60, 180), "apply_note": (45, 120)}  # seconds
-ACTIONS_PER_SESSION = 15
+# After each LinkedIn request or message, LinkedIn alone rests this long (seconds): a few spread-out actions a
+# day, never a burst. Bursts of messages are what got the account restricted on 2026-10-12.
+LINKEDIN_REST = (20 * 60, 45 * 60)
+LINKEDIN_APPLY_PER_RUN = 4  # Easy Apply submissions per LinkedIn run
+LINKEDIN_APPLY_GAP = (120, 300)  # seconds between them, about what reading and applying by hand takes
+LINKEDIN_LOCK = "linkedin_locked"  # kv: LinkedIn showed a login/security check; nothing touches it until you log in
+APPLY_BATCH = 8  # approved applications carried out back to back in one send run
+INSTANT_GAP = (15, 40)  # seconds between items sent the moment you approve them
 OPEN = ("draft", "pending_approval", "approved", "sending", "waiting")
 FATAL_API_ERRORS = (anthropic.AuthenticationError, anthropic.PermissionDeniedError, anthropic.NotFoundError)
 PROFILE_URL = re.compile(r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[^/?#\s]+", re.IGNORECASE)
@@ -53,6 +63,47 @@ def _paused(app: App) -> bool:
 
 def _linkedin(app: App) -> LinkedIn:
     return app.sites["linkedin"]  # type: ignore[return-value]
+
+
+def linkedin_usable(app: App) -> bool:
+    """LinkedIn is switched on and hasn't been locked by a security check you haven't cleared yet."""
+    return app.settings.linkedin.enabled and not app.db.get(LINKEDIN_LOCK)
+
+
+LINKEDIN_FAILS = "linkedin_failures_in_a_row"
+MAX_LINKEDIN_FAILS = 3  # this many failed LinkedIn sends in a row means something changed: stop and look
+SAME_PERSON_DAYS = 3  # never two LinkedIn messages to one person within this many days
+TEAM_GREETING = re.compile(r"^\s*(?:hi|hello|hey|dear)\s+(.+?)\s+team\b", re.IGNORECASE)
+GENERIC_WORDS = {"ai", "inc", "labs", "lab", "technologies", "technology", "tech", "the", "co", "io", "hq", "app"}
+GREETING = re.compile(r"^\s*(?:hi|hello|hey|dear)\s+([^\s,!.:\n]+)", re.IGNORECASE)
+
+
+def linkedin_stopped(why: str) -> str:
+    return (f"🔒 {esc(why)}\n\nSo <b>all LinkedIn activity is stopped</b>. Check the account in your own browser, "
+            "then run <code>jobpilot login linkedin</code> to let jobpilot use it again. Pushing on through a "
+            "warning is what gets accounts restricted.")
+
+
+def lock_linkedin(app: App, why: str) -> bool:
+    """Stop everything on LinkedIn until you log in again. True the first time, so you're told once."""
+    if app.db.get(LINKEDIN_LOCK):
+        return False
+    app.db.put(LINKEDIN_LOCK, app.clock.stamp())
+    log.warning("LinkedIn locked: %s", why)
+    return True
+
+
+def linkedin_resting(app: App) -> bool:
+    rest = app.db.get("linkedin_rest_until")
+    return bool(rest) and rest > app.clock.stamp()
+
+
+def wrong_greeting(body: str, name: str | None) -> str | None:
+    """The name a draft greets when it isn't the recipient's ("Hi Prateek" in a message to Arushi), else None."""
+    found = GREETING.match(body or "")
+    if not found or not name or found.group(1).lower() in ("there", "team", "all", "folks", "everyone"):
+        return None
+    return None if names_match(name, found.group(1)) else found.group(1)
 
 
 def _profile_or_none(url: str | None) -> str | None:
@@ -72,13 +123,15 @@ async def run_site(app: App, name: str) -> str:
     settings = app.settings.site(name)
     site = app.sites[name]
     counts: Counter[str] = Counter()
-    urls = settings.search_urls or site.default_searches
+    urls = list(dict.fromkeys([*(settings.search_urls or site.default_searches),
+                               *role_searches(name, app.settings.profile)]))
     fresh = app.db.jobs(name, ["new"], limit=settings.reads_per_run)
     one_click_ready = not site.needs_note and app.db.jobs(name, ["matched", "queued"], limit=1)
     if urls or any(not job["description"] for job in fresh) or one_click_ready:
         async with app.browser.session() as page:
             if urls:
-                for stub in await site.discover(page, urls, limit=settings.reads_per_run * 4):
+                known = {r["external_id"] for r in app.db.rows("SELECT external_id FROM jobs WHERE site=?", name)}
+                for stub in await site.discover(page, urls, limit=settings.reads_per_run * 4, known=known):
                     if app.db.add_job(name, stub.external_id, stub.url, title=stub.title,
                                       meta={"hint": stub.hint[:600]}):
                         counts["new"] += 1
@@ -127,8 +180,10 @@ async def _read_and_score(app: App, site: Site, job: sqlite3.Row, page: Page | N
             app.db.set_job(job["id"], status="filtered", reason=reason, title=title, company=company,
                            description=description)
             return "filtered"
+        card = meta(job).get("hint")  # listing cards often show the pay the job page leaves out
         score = await app.llm.score_job(site=site.label, url=job["url"], title=title, company=company,
-                                        location=location, description=description)
+                                        location=location,
+                                        description=f"{description}\n\nListing card: {card}" if card else description)
     except (LoggedOut, *FATAL_API_ERRORS):
         raise
     except (LLMError, anthropic.BadRequestError) as exc:
@@ -138,6 +193,9 @@ async def _read_and_score(app: App, site: Site, job: sqlite3.Row, page: Page | N
         return _retry_later(app, job, exc)
     title, company, location = title or score.title, company or score.company, location or score.location
     reason = reject_reason(app.settings.filters, title, company)  # the company may only be known now
+    floor = app.settings.filters.min_salary_lpa
+    if not reason and below_salary_floor(score.salary_max_lpa, floor):
+        reason = f"stated pay tops out at {score.salary_max_lpa:g} LPA, under your {floor:g} LPA minimum"
     status = "filtered" if reason else (
         "matched" if score.score >= app.settings.site(site.name).min_score else "low_score")
     app.db.set_job(job["id"], status=status, title=title, company=company, location=location,
@@ -147,12 +205,14 @@ async def _read_and_score(app: App, site: Site, job: sqlite3.Row, page: Page | N
 
 async def _apply_matches(app: App, page: Page, site: Site, counts: Counter[str]) -> None:
     room = app.settings.site(site.name).apply_per_day - app.db.applied_since(site.name, app.clock.day_start())
+    if site.name == "linkedin":  # a few per run, spread through the day, never a burst
+        room = min(room, LINKEDIN_APPLY_PER_RUN)
     for job in app.db.jobs(site.name, ["queued", "matched"], limit=max(room, 0), best_first=True):
         if _paused(app):
             return
         result = await _apply(app, page, site, job, note=None)
         counts[result.outcome.value] += 1
-        await pause(20, 60)
+        await pause(*(LINKEDIN_APPLY_GAP if site.name == "linkedin" else (20, 60)))
 
 
 async def _apply(app: App, page: Page, site: Site, job: sqlite3.Row, note: str | None) -> ApplyResult:
@@ -162,6 +222,9 @@ async def _apply(app: App, page: Page, site: Site, job: sqlite3.Row, note: str |
     except LoggedOut:
         raise
     except Exception as exc:
+        if NETWORK.search(str(exc)):
+            log.warning("applying to %s hit a network problem; retrying next run: %s", job["id"], str(exc)[:160])
+            return ApplyResult(Outcome.FAILED, "network problem; stays queued")
         log.exception("applying to %s failed", job["id"])
         result = ApplyResult(Outcome.FAILED, f"{type(exc).__name__}: {exc}"[:300])
     if result.outcome is Outcome.NEEDS_INPUT and not result.question:
@@ -254,8 +317,10 @@ async def draft_application_note(app: App, job: sqlite3.Row) -> int:
         draft = Draft(subject=None, body=note_from_template(app, job, company))
     else:
         draft = await app.llm.write("apply_note", company=_company_text(company) or None, job=_job_text(job))
+    auto = {"status": "approved", "approved_at": app.clock.stamp(), "why": "sent without asking (auto_send_notes)"} \
+        if app.settings.site(job["site"]).auto_send_notes else {}
     return app.db.add_outreach("apply_note", draft.body, job_id=job["id"], to_addr=job["url"],
-                               company_id=company["id"] if company else None)
+                               company_id=company["id"] if company else None, **auto)
 
 
 async def draft_connect(app: App, person: sqlite3.Row, company: sqlite3.Row) -> int | None:
@@ -272,7 +337,7 @@ async def draft_connect(app: App, person: sqlite3.Row, company: sqlite3.Row) -> 
                                to_addr=person["linkedin_url"], why=company["fit_reason"])
 
 
-ROLE_WORDS = re.compile(r"\b(backend|back-end|ai|ml|machine learning|llm|software|sde|full[- ]?stack|platform|engineer)\b",
+ROLE_WORDS = re.compile(r"\b(backend|back-end|ai|ml|machine learning|llm|software|sde|fde|forward[- ]deployed|full[- ]?stack|platform|engineer)\b",
                         re.IGNORECASE)
 
 
@@ -398,7 +463,7 @@ async def sync_yc(app: App) -> str:
                   "regions": entry.get("regions") or []},
         )
     scored = 0
-    for company in app.db.companies("new", source="yc", limit=settings.score_per_day):
+    for company in app.db.companies("new", source="yc", limit=settings.score_per_day, newest_batch_first=True):
         if _paused(app):
             break
         try:
@@ -423,6 +488,8 @@ async def _add_waas_jobs(app: App, company: sqlite3.Row, postings: list[dict]) -
         if not location_ok(where, app.settings.yc.job_locations) or reject_reason(app.settings.filters, title,
                                                                                     company["name"]):
             continue
+        if below_salary_floor(salary_max_lpa(posting.get("salaryRange")), app.settings.filters.min_salary_lpa):
+            continue
         details: dict = {}
         try:
             details = await yc.job_page(app.http, posting["url"])
@@ -437,6 +504,18 @@ async def _add_waas_jobs(app: App, company: sqlite3.Row, postings: list[dict]) -
                        meta={"company_id": company["id"], "yc_url": yc.YC_URL + posting["url"],
                              "questions": questions})
     return roles
+
+
+def _pays_below_floor(app: App, postings: list[dict]) -> str:
+    """A YC company is skipped when every engineering role you could take that states its pay pays under your
+    minimum (a well-paid US-only role doesn't count)."""
+    floor = app.settings.filters.min_salary_lpa
+    stated = [pay for p in postings
+              if p.get("role") == "eng" and location_ok(p.get("location") or "", app.settings.yc.job_locations)
+              if (pay := salary_max_lpa(p.get("salaryRange"))) is not None]
+    if stated and all(below_salary_floor(pay, floor) for pay in stated):
+        return f"engineering pay tops out at {max(stated):g} LPA, under your {floor:g} LPA minimum"
+    return ""
 
 
 async def prepare_yc(app: App) -> str:
@@ -454,8 +533,12 @@ async def prepare_yc(app: App) -> str:
         except (httpx.HTTPError, ValueError) as exc:
             log.warning("YC page for %s failed: %s", company["name"], exc)
             continue
-        roles = await _add_waas_jobs(app, company, yc.jobs(props))
+        postings = yc.jobs(props)
+        roles = await _add_waas_jobs(app, company, postings)
         app.db.set_company(company["id"], meta={**meta(company), "roles": roles})
+        if reason := _pays_below_floor(app, postings):
+            app.db.set_company(company["id"], status="pass", fit_reason=reason)
+            continue
         company = app.db.company(company["id"])
         person_ids = [app.db.upsert_person(company["id"], f["name"], _profile_or_none(f["linkedin_url"]),
                                            title=f["title"], meta={"bio": f["bio"]})
@@ -496,7 +579,7 @@ async def _look_up_people(app: App, companies: list[sqlite3.Row]) -> None:
     key = f"lookups:{app.clock.local().date()}"
     used = int(app.db.get(key, "0") or 0)
     budget = app.settings.linkedin.lookups_per_day - used
-    if budget <= 0 or not companies:
+    if budget <= 0 or not companies or not linkedin_usable(app):
         return
     li = _linkedin(app)
     wanted = max(app.settings.outreach.linkedin_per_company, app.settings.outreach.email_per_company)
@@ -546,6 +629,8 @@ def _room(app: App, channel: str) -> bool:
     """Whether today's (and this week's) cap leaves room for one more on this channel."""
     day = app.clock.day_start()
     linkedin = app.settings.linkedin
+    if channel.startswith("li_") and (not linkedin_usable(app) or linkedin_resting(app)):
+        return False
     if channel == "email":
         return app.db.sent_since("email", day) < app.settings.email.per_day
     if channel == "li_connect":
@@ -563,6 +648,8 @@ def _apply_room(app: App, o: sqlite3.Row) -> bool:
     if o["channel"] != "apply_note":
         return True
     job = app.db.job(o["job_id"])
+    if not app.settings.site(job["site"]).enabled:
+        return False
     return app.db.applied_since(job["site"], app.clock.day_start()) < app.settings.site(job["site"]).apply_per_day
 
 
@@ -571,7 +658,7 @@ async def send_email_queue(app: App) -> str:
     if app.mailbox is None:
         return ""
     next_at = app.db.get("email_next_at")
-    if (next_at and next_at > app.clock.stamp()) or not _room(app, "email"):
+    if (next_at and next_at > app.clock.stamp()) or not _room(app, "email") or app.clock.holding("email"):
         return ""
     queue = app.db.outreach_in("approved", ["email"], limit=1)
     if not queue:
@@ -583,6 +670,10 @@ async def send_email_queue(app: App) -> str:
 
 
 async def _send_email(app: App, o: sqlite3.Row) -> None:
+    if refused := _refusal(app, o):
+        app.db.set_outreach(o["id"], status="failed", error=refused)
+        await app.bot.failed(o["id"], refused)
+        return
     parent = app.db.outreach(o["parent_id"]) if o["parent_id"] else None
     if parent is not None and parent["replied_at"]:
         app.db.set_outreach(o["id"], status="cancelled", error="they already replied")
@@ -611,26 +702,168 @@ async def _send_email(app: App, o: sqlite3.Row) -> None:
 
 
 async def send_browser_queue(app: App) -> str:
-    """Carry out approved LinkedIn requests and messages and noted applications, a few per session."""
+    """Carry out the oldest approved LinkedIn request, message or noted application, then free the browser:
+    the gap before the next one is spent applying on the job sites instead of waiting."""
     app.db.release_waiting()
+    next_at = app.db.get("actions_next_at")
+    if next_at and next_at > app.clock.stamp():
+        return ""
     queue = [o for o in app.db.outreach_in("approved", BROWSER_CHANNELS, limit=50)
-             if _room(app, o["channel"]) and _apply_room(app, o)]
+             if _room(app, o["channel"]) and _apply_room(app, o) and not app.clock.holding(o["channel"])]
     if not queue:
         return ""
-    handled = 0
+    o = queue[0]
+    done: Counter[str] = Counter()
     async with app.browser.session() as page:
-        for o in queue[:ACTIONS_PER_SESSION]:
-            if _paused(app):
+        if app.db.outreach(o["id"])["status"] != "approved":
+            return ""  # sent the moment it was approved, while Chrome was starting
+        await _browser_action(app, page, o)
+        # Applications go in a batch, a short gap apart, instead of one per pass of the whole schedule.
+        # LinkedIn items never do: each one is followed by LinkedIn's long rest.
+        while o["channel"] == "apply_note" and sum(done.values()) < APPLY_BATCH - 1 and not _paused(app):
+            done[app.db.outreach(o["id"])["status"]] += 1
+            more = [n for n in app.db.outreach_in("approved", ["apply_note"], limit=5)
+                    if _apply_room(app, n) and not app.clock.holding("apply_note")]
+            if not more:
                 break
-            if not (_room(app, o["channel"]) and _apply_room(app, o)):
-                continue  # a cap filled up during this session
+            await pause(*ACTION_GAPS["apply_note"])
+            o = more[0]
             await _browser_action(app, page, o)
-            handled += 1
-            await pause(*ACTION_GAPS[o["channel"]])
-    return f"carried out {handled} approved browser actions"
+    if done:
+        done[app.db.outreach(o["id"])["status"]] += 1
+        if done["sent"]:
+            gap = random.uniform(*ACTION_GAPS["apply_note"])
+            app.db.put("actions_next_at", iso(app.clock.now() + timedelta(seconds=gap)))
+        return "applications: " + ", ".join(f"{n} {status}" for status, n in done.items())
+    if app.db.outreach(o["id"])["status"] == "sent":
+        gap = random.uniform(*ACTION_GAPS[o["channel"]])
+        app.db.put("actions_next_at", iso(app.clock.now() + timedelta(seconds=gap)))
+    if o["channel"].startswith("li_"):  # failed or not, LinkedIn rests: a run of quick failures looks like a bot
+        rest_linkedin(app)
+    return f"{o['channel'].replace('_', ' ')} #{o['id']}: {app.db.outreach(o['id'])['status']}"
+
+
+def rest_linkedin(app: App) -> None:
+    app.db.put("linkedin_rest_until", iso(app.clock.now() + timedelta(seconds=random.uniform(*LINKEDIN_REST))))
+
+
+def _held_back(app: App, o: sqlite3.Row) -> str:
+    """Why an approved item can't go out right now (it stays queued for the scheduled run), or ""."""
+    if _paused(app):
+        return "Paused: it goes out after /resume."
+    if not app.clock.working():
+        return "Outside working hours: it goes out when they start."
+    if app.clock.holding(o["channel"]):
+        what = {"email": "emails", "li_message": "LinkedIn messages", "li_connect": "connection requests",
+                "apply_note": "applications"}.get(o["channel"], o["channel"])
+        if app.clock.held_day():
+            return f"No {what} go out on {app.clock.local():%A}s: it's queued and goes out the next day."
+        return (f"{what.capitalize()} go out between {app.clock.send_start:%H:%M} and {app.clock.send_end:%H:%M}: "
+                "it's queued until then.")
+    if o["channel"].startswith("li_") and not app.settings.linkedin.enabled:
+        return "LinkedIn is switched off: it stays queued until it's back on."
+    if o["channel"].startswith("li_") and app.db.get(LINKEDIN_LOCK):
+        return "LinkedIn asked for a security check: it stays queued until you run `jobpilot login linkedin`."
+    if o["channel"].startswith("li_") and linkedin_resting(app):
+        return "LinkedIn is resting between sends: it goes out in the next slot."
+    if not (_room(app, o["channel"]) and _apply_room(app, o)):
+        return "Today's limit is reached: it goes out tomorrow."
+    if o["channel"] == "email" and app.mailbox is None:
+        return "Gmail isn't set up, so it can't be sent."
+    return ""
+
+
+def queue_outlook(app: App) -> list[tuple[str, int, str]]:
+    """What the approved queue will do from here: (channel, how many, why it waits or "" if it goes now)."""
+    groups: Counter[tuple[str, str]] = Counter()
+    for o in app.db.outreach_in("approved", limit=1000):
+        groups[(o["channel"], _held_back(app, o))] += 1
+    return [(channel, n, why) for (channel, why), n in groups.items()]
+
+
+async def send_now(app: App, outreach_id: int) -> None:
+    """Send, apply or connect the moment you approve, instead of waiting for the next scheduled run.
+    One at a time, in the order you tapped; anything held back stays approved for the scheduled queue."""
+    lock = getattr(app, "send_now_lock", None)
+    if lock is None:
+        lock = app.send_now_lock = asyncio.Lock()
+    async with lock:
+        o = app.db.outreach(outreach_id)
+        if o is None or o["status"] != "approved":
+            return
+        held = _held_back(app, o)
+        if held:
+            await app.bot.mark(o["id"], f"✅ Approved. {held}")
+            return
+        if o["channel"] == "email":
+            await _send_email(app, o)
+            return
+        app.db.set_outreach(o["id"], status="sending")  # claimed: the scheduled queue now skips it
+        try:
+            async with app.browser.page() as page:
+                await _browser_action(app, page, o)
+        except LoggedOut as exc:
+            app.db.set_outreach(o["id"], status="approved")
+            if "linkedin.com" not in str(exc):
+                await app.bot.notify(f"🔒 {esc(str(exc))}")
+            elif lock_linkedin(app, str(exc)):
+                await app.bot.notify(linkedin_stopped(str(exc)))
+        except Exception as exc:  # e.g. Chrome wouldn't start: leave it for the scheduled queue
+            log.exception("sending #%s right away failed", o["id"])
+            if app.db.outreach(o["id"])["status"] == "sending":
+                app.db.set_outreach(o["id"], status="approved")
+            await app.bot.mark(o["id"], f"✅ Approved. Couldn't send right away ({esc(type(exc).__name__)}); "
+                                        "it goes with the next send run.")
+        if o["channel"].startswith("li_") and app.db.outreach(o["id"])["status"] != "approved":
+            rest_linkedin(app)  # what you tap next for LinkedIn waits for its slot instead of going in a burst
+        await pause(*INSTANT_GAP)  # a breather before the next one you tapped, so LinkedIn doesn't see a burst
+
+
+def same_company(greeted: str, company: str) -> bool:
+    """"Vested" and "Vested Finance", "cardboard.ai" and "Cardboard" are the same; "Finn" and "Huvo AI" aren't."""
+    words = lambda name: {w for w in re.split(r"[^a-z0-9]+", name.lower()) if w and w not in GENERIC_WORDS}  # noqa: E731
+    a, b = words(greeted), words(company)
+    squash = lambda name: re.sub(r"[^a-z0-9]", "", name.lower())  # noqa: E731
+    return bool(a & b) or not a or squash(greeted) in squash(company) or squash(company) in squash(greeted)
+
+
+def _refusal(app: App, o: sqlite3.Row) -> str | None:
+    """Why this must not go out at all, checked before anything is opened or typed."""
+    if o["channel"] == "apply_note" and o["job_id"]:
+        job = app.db.job(o["job_id"])
+        found = TEAM_GREETING.match(o["body"] or "")
+        if job and job["company"] and found and not same_company(found.group(1), job["company"]):
+            return f"Not sent: the note greets the {found.group(1)} team, but the job is at {job['company']}"
+    person = app.db.person(o["person_id"]) if o["person_id"] else None
+    if person is None:
+        return None
+    if other := wrong_greeting(o["body"], person["name"]):
+        return f"Not sent: the text greets {other!r}, but it's going to {person['name']}"
+    if o["channel"] == "li_message" and app.db.scalar(
+            "SELECT COUNT(*) FROM outreach WHERE channel='li_message' AND person_id=? AND status='sent' "
+            "AND sent_at>=? AND id!=?", person["id"], app.clock.ago(days=SAME_PERSON_DAYS), o["id"]):
+        return f"Not sent: {person['name']} already got a LinkedIn message in the last {SAME_PERSON_DAYS} days"
+    return None
+
+
+async def _tally_linkedin(app: App, outreach_id: int) -> None:
+    """Count LinkedIn sends that fail in a row; past MAX_LINKEDIN_FAILS, stop LinkedIn and tell you."""
+    o = app.db.outreach(outreach_id)
+    if o["status"] in ("sent", "skipped", "dry_run"):
+        app.db.put(LINKEDIN_FAILS, "0")
+    elif o["status"] == "failed":
+        fails = int(app.db.get(LINKEDIN_FAILS, "0") or 0) + 1
+        app.db.put(LINKEDIN_FAILS, str(fails))
+        why = f"{fails} LinkedIn sends failed in a row (the last: {o['error']})"
+        if fails >= MAX_LINKEDIN_FAILS and lock_linkedin(app, why):
+            await app.bot.notify(linkedin_stopped(why))
 
 
 async def _browser_action(app: App, page: Page, o: sqlite3.Row) -> None:
+    if refused := _refusal(app, o):
+        app.db.set_outreach(o["id"], status="failed", error=refused)
+        await app.bot.failed(o["id"], refused)
+        return
     app.db.set_outreach(o["id"], status="sending")
     try:
         if o["channel"] == "apply_note":
@@ -644,10 +877,14 @@ async def _browser_action(app: App, page: Page, o: sqlite3.Row) -> None:
         raise
     except Exception as exc:
         log.exception("outreach #%s failed", o["id"])
-        shot = await app.browser.screenshot(page, f"outreach-{o['id']}")
-        reason = f"{type(exc).__name__}: {exc}"[:250]
-        app.db.set_outreach(o["id"], status="failed", error=reason)
-        await app.bot.failed(o["id"], f"{reason} (screenshot: {shot})")
+        # if it went out, only the Telegram update after it failed, and a retry would send it twice
+        if app.db.outreach(o["id"])["status"] != "sent":
+            shot = await app.browser.screenshot(page, f"outreach-{o['id']}")
+            reason = f"{type(exc).__name__}: {exc}"[:250]
+            app.db.set_outreach(o["id"], status="failed", error=reason)
+            await app.bot.failed(o["id"], f"{reason} (screenshot: {shot})")
+    if o["channel"].startswith("li_"):
+        await _tally_linkedin(app, o["id"])
 
 
 async def _send_application(app: App, page: Page, o: sqlite3.Row) -> None:
@@ -669,12 +906,25 @@ async def _send_application(app: App, page: Page, o: sqlite3.Row) -> None:
 
 async def _send_connect(app: App, page: Page, o: sqlite3.Row) -> None:
     person = app.db.person(o["person_id"])
-    reach, detail = await _linkedin(app).connect(page, o["to_addr"], person["name"], o["body"], app.settings.dry_run)
+    linkedin = _linkedin(app)
+    note = as_text(o["body"]).strip()  # LinkedIn shows HTML as raw tags, so a draft that carries some is flattened
+    reach, detail = await linkedin.connect(page, o["to_addr"], person["name"], note, app.settings.dry_run)
+    without_note = reach is Reach.NOTE_QUOTA and bool(note)
+    if without_note:  # free plan: notes run out, but a plain request still goes through
+        await pause(2.0, 4.0)
+        reach, detail = await linkedin.connect(page, o["to_addr"], person["name"], "", app.settings.dry_run)
+        detail = detail or "sent without the note: LinkedIn's free plan won't take one right now"
     stamp = app.clock.stamp()
     if reach in (Reach.SENT, Reach.PENDING):
         app.db.set_outreach(o["id"], status="sent", sent_at=stamp, error=detail or None)
         app.db.set_person(person["id"], li_state="requested", li_requested_at=stamp)
-        await app.bot.mark(o["id"], "📤 Request sent." if reach is Reach.SENT else "Already pending on LinkedIn.")
+        if reach is Reach.PENDING:
+            await app.bot.mark(o["id"], "Already pending on LinkedIn.")
+        elif without_note:
+            await app.bot.mark(o["id"], "📤 Request sent <b>without the note</b>: LinkedIn's free plan "
+                                        "won't take one right now.")
+        else:
+            await app.bot.mark(o["id"], "📤 Request sent.")
     elif reach is Reach.CONNECTED:
         app.db.set_outreach(o["id"], status="skipped", error="already connected")
         app.db.set_person(person["id"], li_state="connected")
@@ -690,13 +940,14 @@ async def _send_connect(app: App, page: Page, o: sqlite3.Row) -> None:
                              "paused for 3 days; the approved ones stay queued.")
     else:
         app.db.set_outreach(o["id"], status="failed", error=f"{reach.value}: {detail}")
-        await app.bot.failed(o["id"], detail or reach.value.replace("_", " "), without_note=reach is Reach.NOTE_QUOTA)
+        await app.bot.failed(o["id"], detail or reach.value.replace("_", " "), without_note=reach is Reach.NOTE_QUOTA and not without_note)
 
 
 async def _send_message(app: App, page: Page, o: sqlite3.Row) -> None:
     person = app.db.person(o["person_id"])
     resume = app.paths.resume_pdf if app.settings.linkedin.attach_resume and app.paths.resume_pdf.exists() else None
-    reach, detail = await _linkedin(app).message(page, o["to_addr"], person["name"], o["body"], app.settings.dry_run,
+    reach, detail = await _linkedin(app).message(page, o["to_addr"], person["name"], as_text(o["body"]).strip(),
+                                                 app.settings.dry_run,
                                                  attachment=resume)
     stamp = app.clock.stamp()
     if reach is Reach.SENT:
@@ -800,6 +1051,7 @@ async def draft_followups(app: App) -> str:
 
 
 async def show_cards(app: App) -> str:
+    await app.bot.register_commands()
     shown = await app.bot.pump()
     return f"showed {shown} cards" if shown else ""
 

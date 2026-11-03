@@ -49,6 +49,7 @@ class FakeLLM:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
         self.job_score = 80
+        self.salary: float | None = None
         self.fit_score = 80
         self.answers: dict[str, tuple[str, bool]] = {}
         self.scouted: list = []
@@ -57,7 +58,8 @@ class FakeLLM:
     async def score_job(self, **kw: Any) -> JobScore:
         self.calls.append(("score_job", kw))
         return JobScore(score=self.job_score, reason="solid backend match", title=kw["title"] or "Backend Engineer",
-                        company=kw["company"] or "Acme", location=kw["location"] or "Bengaluru")
+                        company=kw["company"] or "Acme", location=kw["location"] or "Bengaluru",
+                        salary_max_lpa=self.salary)
 
     async def score_company(self, text: str) -> Fit:
         self.calls.append(("score_company", text))
@@ -116,6 +118,11 @@ class FakeBrowser:
         self.sessions += 1
         yield object()
 
+    @asynccontextmanager
+    async def page(self):
+        async with self.session() as page:
+            yield page
+
     async def screenshot(self, page, label: str) -> str:
         return f"/tmp/{label}.png"
 
@@ -132,8 +139,8 @@ class FakeSite:
         self.results: dict[str, ApplyResult] = {}
         self.applied: list[tuple] = []
 
-    async def discover(self, page, urls, limit):
-        return self.stubs[:limit]
+    async def discover(self, page, urls, limit, known=()):
+        return [s for s in self.stubs if s.external_id not in known][:limit]
 
     async def read(self, page, url):
         return self.pages[url]
@@ -148,12 +155,15 @@ class FakeLinkedIn(FakeSite):
         super().__init__("linkedin")
         self.reach, self.detail = Reach.SENT, ""
         self.connected = False
+        self.note_quota_blocks_all = False
         self.connects: list[tuple] = []
         self.messages: list[tuple] = []
         self.attachments: list = []
 
     async def connect(self, page, url, expected, note, dry_run):
         self.connects.append((url, expected, note, dry_run))
+        if self.reach is Reach.NOTE_QUOTA and not note and not self.note_quota_blocks_all:
+            return Reach.SENT, ""
         return (Reach.DRY_RUN, "stopped") if dry_run else (self.reach, self.detail)
 
     async def message(self, page, url, expected, text, dry_run, attachment=None):

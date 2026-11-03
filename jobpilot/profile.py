@@ -33,7 +33,7 @@ def candidate_context(profile: Profile, resume: str) -> str:
         ("GitHub", profile.github_url),
         ("Website", profile.website),
         ("Total experience", f"{profile.years_experience:g} years" if profile.years_experience else ""),
-        ("Notice period", f"{profile.notice_period_days} days"),
+        ("Notice period", f"{profile.notice_days()} days ({profile.start_text()})"),
         ("Target roles", ", ".join(profile.target_roles)),
         ("Preferred locations", ", ".join(profile.preferred_locations)),
         ("Work authorization", profile.work_authorization),

@@ -27,10 +27,17 @@ SCAN_JS = r"""(root) => {
   const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\s*\*\s*$/, '').replace(/\s*\(?required\)?\s*$/i, '').trim();
   const shown = el => { if (!el) return false; const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none'; };
+  const numbering = s => /^\(?\d{1,2}[.)]?$/.test(s);  // Hirist puts "1." and its question in separate lines
+  const headline = text => {
+    const lines = (text || '').split('\n');
+    let i = 0;
+    if (numbering(clean(lines[0]))) { i = 1; while (i < lines.length && !clean(lines[i])) i++; }
+    return clean(lines[i] || '');
+  };
   const textById = id => { const n = id && document.getElementById(id); return n ? n.innerText : ''; };
   const markedRequired = (el, holder) => el.required || el.getAttribute('aria-required') === 'true' ||
     /\*\s*$/.test(((holder && holder.innerText) || '').trim()) ||
-    !!(holder && (/required/i.test(holder.className || '') || holder.querySelector('[class*="required" i]')));
+    !!(holder && (/required/i.test(holder.className || '') || holder.querySelector('[class*="required" i], [class*="mandatory" i]')));
   const labelOf = el => {
     if (el.labels && el.labels.length) { const t = clean([...el.labels].map(l => l.innerText).join(' ')); if (t) return [t, el.labels[0]]; }
     const ids = el.getAttribute('aria-labelledby');
@@ -40,7 +47,7 @@ SCAN_JS = r"""(root) => {
     if (legend && clean(legend.innerText)) return [clean(legend.innerText), legend];
     let node = el.parentElement;
     for (let i = 0; i < 4 && node && node !== root; i++, node = node.parentElement) {
-      const first = clean((node.innerText || '').split('\n')[0]);
+      const first = headline(node.innerText);
       if (first && first.length < 250) return [first, node];
     }
     return [clean(el.getAttribute('placeholder') || el.getAttribute('name') || ''), null];
@@ -67,7 +74,7 @@ SCAN_JS = r"""(root) => {
     let node = radios[0].parentElement;
     while (node && node !== root && !radios.every(r => node.contains(r))) node = node.parentElement;
     for (let i = 0; i < 4 && node; i++, node = node.parentElement) {
-      const first = clean((node.innerText || '').split('\n').find(line => line.trim() && !options.includes(clean(line))) || '');
+      const first = clean((node.innerText || '').split('\n').find(line => line.trim() && !options.includes(clean(line)) && !numbering(clean(line))) || '');
       if (first && first.length < 250) return [first, node];
       if (node === root) break;
     }
@@ -223,9 +230,15 @@ def from_profile(profile: Profile, field: Field) -> str | None:
     if re.search(r"\b(website|portfolio|personal site|blog)\b", q):
         return profile.website or profile.github_url or None
     if "notice period" in q or re.search(r"\b(when can you (start|join)|availability to (start|join))\b", q):
-        days = profile.notice_period_days
+        days = profile.notice_days()
         return "Immediately" if days == 0 and field.kind in ("radio", "select") else f"{days} days"
     pay = r"(ctc|salary|compensation|pay|package|remuneration)"
+    # "expected fixed salary", "current fixed CTC": the fixed part, when the profile has one
+    if re.search(rf"\bfixed\b", q) and re.search(rf"\b{pay}\b|\bfixed (component|part)\b", q):
+        if re.search(r"\b(expected|desired)\b|expectation", q) and profile.expected_fixed:
+            return money(profile.expected_fixed, q)
+        if re.search(r"\b(current|present|existing|last drawn)\b", q) and profile.current_fixed:
+            return money(profile.current_fixed, q)
     # "current annual CTC", "present fixed salary", "current CTC (in LPA)"
     if re.search(rf"\b(expected|desired)\b(\s+\w+){{0,2}}\s+{pay}\b|salary expectation|\bectc\b", q):
         return money(profile.expected_ctc, q)

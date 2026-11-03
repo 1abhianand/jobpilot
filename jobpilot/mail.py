@@ -7,6 +7,7 @@ asyncio.to_thread.
 from __future__ import annotations
 
 import email
+import html
 import imaplib
 import re
 import smtplib
@@ -17,6 +18,9 @@ from email.message import EmailMessage
 from email.utils import formataddr, formatdate, getaddresses, make_msgid, parseaddr
 from pathlib import Path
 
+TAG = re.compile(r"</?(?:p|a|br|b|i|strong|em|ul|ol|li|div|span)\b[^>]*>", re.IGNORECASE)
+LINK = re.compile(r"""<a\s[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>""", re.IGNORECASE | re.DOTALL)
+URL = re.compile(r"\b((?:https?://|www\.)[^\s<>()]+[^\s<>().,;:!?'\"])|\b((?:linkedin\.com|github\.com)/[^\s<>()]+[^\s<>().,;:!?'\"])")
 HEADERS = "(BODY.PEEK[HEADER.FIELDS (FROM IN-REPLY-TO REFERENCES X-FAILED-RECIPIENTS)])"
 DAEMONS = ("mailer-daemon", "postmaster")
 
@@ -38,6 +42,35 @@ class InboxReport:
     bounced: set[str] = field(default_factory=set)  # watched addresses that bounced
 
 
+def as_text(body: str) -> str:
+    """The plain-text part. A draft that carries HTML (a link added through Edit or Rewrite, say) is turned
+    back into readable text: <a href="u">Resume</a> becomes "Resume: u", paragraphs become blank lines."""
+    if not TAG.search(body):
+        return body
+    text = LINK.sub(lambda m: f"{m.group(2).strip()}: {m.group(1)}" if m.group(2).strip() != m.group(1) else m.group(1),
+                    body)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p>\s*<p\b[^>]*>", "\n\n", text, flags=re.IGNORECASE)
+    text = html.unescape(TAG.sub("", text))
+    return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
+
+
+def as_html(body: str) -> str:
+    """The HTML part: real paragraphs and clickable links, whether the draft was plain text or carried HTML."""
+    if TAG.search(body):
+        if not re.search(r"<p\b", body, re.IGNORECASE):  # HTML links in plain paragraphs
+            body = "".join(f"<p>{part.strip()}</p>" for part in re.split(r"\n\s*\n", body) if part.strip())
+        return f"<div>{body.replace(chr(10), '<br>')}</div>"
+
+    def link(m: re.Match) -> str:
+        url = m.group(0)
+        href = url if url.startswith(("http://", "https://")) else f"https://{url}"
+        return f'<a href="{href}">{url}</a>'
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", html.escape(body, quote=False)) if p.strip()]
+    return "<div>" + "".join(f"<p>{URL.sub(link, p).replace(chr(10), '<br>')}</p>" for p in paragraphs) + "</div>"
+
+
 def build_message(box: Mailbox, to: str, subject: str, body: str, *, in_reply_to: str | None = None,
                   attachment: Path | None = None) -> EmailMessage:
     message = EmailMessage()
@@ -49,7 +82,8 @@ def build_message(box: Mailbox, to: str, subject: str, body: str, *, in_reply_to
     if in_reply_to:  # keeps a follow-up in the same thread
         message["In-Reply-To"] = in_reply_to
         message["References"] = in_reply_to
-    message.set_content(body)
+    message.set_content(as_text(body))
+    message.add_alternative(as_html(body), subtype="html")  # clickable links, never raw tags
     if attachment:
         message.add_attachment(attachment.read_bytes(), maintype="application", subtype="pdf",
                                filename=attachment.name)

@@ -66,22 +66,30 @@ class EmailFinder:
         if not first or not domain:
             return None, "no name or domain"
         if self.hunter_key:
-            found = await self._hunter(first, last, domain)
+            found = await self._hunter(first, last, domain, full_name)
             if found:
                 return found
         if not await has_mx(domain):
             return None, "domain takes no email"
         return f"{first}@{domain}", "guess"
 
-    async def _hunter(self, first: str, last: str, domain: str) -> tuple[str, str] | None:
-        params = {"domain": domain, "first_name": first, "last_name": last, "api_key": self.hunter_key}
+    async def _hunter(self, first: str, last: str, domain: str, full_name: str) -> tuple[str, str] | None:
+        params = {"domain": domain, "api_key": self.hunter_key}
+        if last:
+            params |= {"first_name": first, "last_name": last}
+        else:
+            # Hunter wants both names or the whole one, and split_name drops initials: "Abhishek E" arrives
+            # with no surname, which the two-field form answers with HTTP 400.
+            params["full_name"] = full_name.strip()
         try:
             response = await self.http.get(HUNTER_FINDER, params=params, timeout=20)
         except httpx.HTTPError as exc:
             log.warning("Hunter lookup failed for %s: %s", domain, exc)
             return None
         if response.status_code != 200:
-            log.warning("Hunter returned HTTP %s (quota used up or bad key?)", response.status_code)
+            why = {400: "not enough of a name to search on", 401: "bad key",
+                   403: "plan limit reached", 429: "quota used up"}.get(response.status_code, "unexpected reply")
+            log.warning("Hunter returned HTTP %s for %s at %s (%s)", response.status_code, full_name, domain, why)
             return None
         data = response.json().get("data") or {}
         score = data.get("score") or 0

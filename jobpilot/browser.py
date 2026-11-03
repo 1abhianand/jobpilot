@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from playwright.async_api import Locator, Page, async_playwright
+from playwright.async_api import BrowserContext, Locator, Page, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from .config import BrowserSettings
@@ -75,6 +75,8 @@ class Browser:
         self.profile_dir = profile_dir
         self.shots_dir = shots_dir
         self._lock = asyncio.Lock()
+        self._context: BrowserContext | None = None  # the open session, if any, so instant sends can borrow it
+        self._borrowed = 0
 
     @asynccontextmanager
     async def session(self, headless: bool | None = None) -> AsyncIterator[Page]:
@@ -102,9 +104,33 @@ class Browser:
             try:
                 page = context.pages[0] if context.pages else await context.new_page()
                 page.set_default_timeout(20_000)
+                self._context = context
                 yield page
             finally:
+                self._context = None
+                while self._borrowed:  # let an instant send in another tab finish first
+                    await asyncio.sleep(0.5)
                 await context.close()
+
+    @asynccontextmanager
+    async def page(self) -> AsyncIterator[Page]:
+        """A page right now: a new tab in the session that's already open (say, a site scan), or a session of
+        its own when Chrome isn't running. Used to act the moment you approve, without waiting for the browser."""
+        context = self._context
+        if context is None:
+            async with self.session() as page:
+                yield page
+            return
+        self._borrowed += 1
+        try:
+            page = await context.new_page()
+            page.set_default_timeout(20_000)
+            try:
+                yield page
+            finally:
+                await page.close()
+        finally:
+            self._borrowed -= 1
 
     async def screenshot(self, page: Page, label: str) -> str:
         self.shots_dir.mkdir(parents=True, exist_ok=True)

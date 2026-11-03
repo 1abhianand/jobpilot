@@ -114,3 +114,9 @@ def test_prompts_carry_the_right_instructions():
     assert '["0-2", "3+"]' in answer
     system = prompts.system(profile, "CONTEXT")
     assert system.endswith("CONTEXT") and "Asha" in system
+
+
+def test_unescape_turns_leftover_json_escapes_into_characters():
+    from jobpilot.llm import unescape
+    assert unescape(r"wrong answers cost \u2014 a lot") == "wrong answers cost — a lot"
+    assert unescape("C:\\users and plain text") == "C:\\users and plain text"
